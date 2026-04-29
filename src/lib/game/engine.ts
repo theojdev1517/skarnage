@@ -10,6 +10,7 @@ export function now(): string {
 // Game Creation & Joining
 export function createNewGame(hostId: string, hostName: string): GameState {
   const gameId = `game_${Date.now()}`;
+  const fullDeck = createStandardDeck();
 
   const hostPlayer: Player = {
     user_id: hostId,
@@ -47,6 +48,8 @@ export function createNewGame(hostId: string, hostName: string): GameState {
     side_pots: [],
     action_history: [],
     last_action: "Game created",
+    deck: fullDeck,
+    deck_index: 0,
   };
 }
 
@@ -141,12 +144,17 @@ export function shredCards(game: GameState): GameState {
   };
 }
 
-export function dealHoleCards(game: GameState, shuffledDeck: Card[]): GameState {
+export function dealHoleCards(game: GameState): GameState {
   if (game.players.length === 0) throw new Error("No players to deal to");
-  let deckIndex = 0;
-  const updatedPlayers = game.players.map(player => {
+
+  let newGame = { ...game };
+  let idx = newGame.deck_index;
+
+  const updatedPlayers = newGame.players.map(player => {
     const holeCards: Card[] = [];
-    for (let i = 0; i < 5; i++) holeCards.push(shuffledDeck[deckIndex++]);
+    for (let i = 0; i < 5; i++) {
+      holeCards.push(newGame.deck[idx++]);
+    }
     return {
       ...player,
       hole_cards: holeCards,
@@ -157,13 +165,12 @@ export function dealHoleCards(game: GameState, shuffledDeck: Card[]): GameState 
     };
   });
 
-  return {
-    ...game,
-    players: updatedPlayers,
-    status: "preflop_betting" as GameStatus,
-    updated_at: now(),
-    last_action: `Dealt 5 hole cards to ${game.players.length} players`,
-  };
+  newGame.players = updatedPlayers;
+  newGame.deck_index = idx;
+  newGame.status = 'preflop_betting' as GameStatus;
+  newGame.last_action = `Dealt 5 hole cards to ${newGame.players.length} players`;
+
+  return newGame;
 }
 
 export function shuffleDeck(deck: Card[]): Card[] {
@@ -175,46 +182,56 @@ export function shuffleDeck(deck: Card[]): Card[] {
   return shuffled;
 }
 
-export function dealFlop(game: GameState, shuffledDeck: Card[], deckIndex: number): GameState {
-  const topFlop = [shuffledDeck[deckIndex], shuffledDeck[deckIndex+1], shuffledDeck[deckIndex+2]];
-  const shredderFlop = [shuffledDeck[deckIndex+3], shuffledDeck[deckIndex+4], shuffledDeck[deckIndex+5]];
+export function dealFlop(game: GameState): GameState {
+  let newGame = { ...game };
+  let idx = newGame.deck_index;
 
-  let newGame = {
-    ...game,
-    board: { top: [...topFlop, null, null, null], shredder: [...shredderFlop, null, null, null] },
-    status: "flop_betting" as GameStatus,
-    updated_at: now(),
-    last_action: "Flop dealt + auto-shredded",
+  const topFlop = [newGame.deck[idx], newGame.deck[idx + 1], newGame.deck[idx + 2]];
+  const shredderFlop = [newGame.deck[idx + 3], newGame.deck[idx + 4], newGame.deck[idx + 5]];
+
+  newGame.board = {
+    top: [...topFlop, null, null, null],
+    shredder: [...shredderFlop, null, null, null]
   };
-  return shredCards(newGame);
+
+  newGame.deck_index = idx + 6;
+  newGame = shredCards(newGame);
+  newGame.last_action = "Flop dealt + auto-shred";
+
+  return newGame;
 }
 
-export function dealTurn(game: GameState, shuffledDeck: Card[], deckIndex: number): GameState {
-  let newGame = {
-    ...game,
-    board: {
-      top: [...game.board.top.slice(0, 3), shuffledDeck[deckIndex], null, null],
-      shredder: [...game.board.shredder.slice(0, 3), shuffledDeck[deckIndex+1], null, null]
-    },
-    status: "turn_betting" as GameStatus,
-    updated_at: now(),
-    last_action: "Turn dealt + auto-shredded",
+export function dealTurn(game: GameState): GameState {
+  let newGame = { ...game };
+  let idx = newGame.deck_index;
+
+  newGame.board = {
+    top: [...newGame.board.top.slice(0, 3), newGame.deck[idx], null, null],
+    shredder: [...newGame.board.shredder.slice(0, 3), newGame.deck[idx + 1], null, null]
   };
-  return shredCards(newGame);
+
+  newGame.deck_index = idx + 2;
+  newGame = shredCards(newGame);
+  newGame.last_action = "Turn dealt + auto-shred";
+
+  return newGame;
 }
 
-export function dealRiver(game: GameState, shuffledDeck: Card[], deckIndex: number): GameState {
-  let newGame = {
-    ...game,
-    board: {
-      top: [...game.board.top.slice(0, 4), shuffledDeck[deckIndex]],
-      shredder: [...game.board.shredder.slice(0, 4), shuffledDeck[deckIndex+1]]
-    },
-    status: "showdown" as GameStatus,
-    updated_at: now(),
-    last_action: "River dealt + auto-shredded",
+export function dealRiver(game: GameState): GameState {
+  let newGame = { ...game };
+  let idx = newGame.deck_index;
+
+  newGame.board = {
+    top: [...newGame.board.top.slice(0, 4), newGame.deck[idx]],
+    shredder: [...newGame.board.shredder.slice(0, 4), newGame.deck[idx + 1]]
   };
-  return shredCards(newGame);
+
+  newGame.deck_index = idx + 2;
+  newGame = shredCards(newGame);
+  newGame.status = 'river_betting' as GameStatus;
+  newGame.last_action = "River dealt + auto-shred";
+
+  return newGame;
 }
 
 // Betting System
@@ -643,6 +660,7 @@ export function postBlinds(state: GameState): GameState {
 export function startNewHand(state: GameState): GameState {
   let newState = rotateButton(state);
 
+  // Reset players
   newState.players = newState.players.map(player => ({
     ...player,
     hole_cards: [],
@@ -657,11 +675,16 @@ export function startNewHand(state: GameState): GameState {
     hand_result: null,
   }));
 
+  // Reset deck for new hand
+  const freshDeck = shuffleDeck(createStandardDeck());
+
   newState = postBlinds(newState);
 
   newState.hand_number = (newState.hand_number || 0) + 1;
   newState.skip_discard_eligible = false;
   newState.board = { top: [null, null, null, null, null, null], shredder: [null, null, null, null, null, null] };
+  newState.deck = freshDeck;
+  newState.deck_index = 0;
 
   return newState;
 }
@@ -670,59 +693,35 @@ export function startNewHand(state: GameState): GameState {
  * Centralizes all dealing + position + status transitions.
  * This is the single place that knows "what comes after what".
  */
-export function advanceToNextPhase(game: GameState, deck: Card[]): GameState {
+export function advanceToNextPhase(game: GameState): GameState {
   let newGame = { ...game };
 
-    // Safety: never advance if betting round isn't complete
-  if (['preflop_betting', 'flop_betting', 'turn_betting', 'river_betting'].includes(newGame.status)) {
-    if (!isBettingRoundComplete(newGame)) {
-      console.warn("🚨 advanceToNextPhase called but round not complete!");
-      return newGame; // don't advance
-    }
-  }
-
-  // Reset per-street betting state
-  newGame.players = newGame.players.map(p => ({
-    ...p,
-    bet_this_street: 0,
-  }));
+  newGame.players = newGame.players.map(p => ({ ...p, bet_this_street: 0 }));
   newGame.current_wager = 0;
   newGame.last_aggressor_seat = null;
 
   if (newGame.status === 'preflop_betting' || newGame.status === 'dealt_holes') {
-  newGame = dealFlop(newGame, deck, 15);
-  newGame.current_player_seat = getFirstToAct(newGame, 'postflop');
-  newGame.status = 'flop_betting' as GameStatus;
-  newGame.last_action = 'Flop dealt + auto-shred';
-
-  // Ensure preflop wager state is clean for next round check
-  newGame.current_wager = 0; // optional safety}
-  }
-
-   else if (newGame.status === 'flop_betting') {
-    // Turn
-    newGame = dealTurn(newGame, deck, 21);
+    newGame = dealFlop(newGame);
+    newGame.current_player_seat = getFirstToAct(newGame, 'postflop');
+    newGame.status = 'flop_betting' as GameStatus;
+  } else if (newGame.status === 'flop_betting') {
+    newGame = dealTurn(newGame);
     newGame.current_player_seat = getFirstToAct(newGame, 'postflop');
     newGame.status = 'turn_betting' as GameStatus;
-    newGame.last_action = 'Turn dealt + auto-shred';
-
   } else if (newGame.status === 'turn_betting') {
-    // River
-    newGame = dealRiver(newGame, deck, 23);
+    newGame = dealRiver(newGame);
     newGame.current_player_seat = getFirstToAct(newGame, 'postflop');
     newGame.status = 'river_betting' as GameStatus;
-    newGame.last_action = 'River dealt + auto-shred';
-
   } else if (newGame.status === 'river_betting') {
     newGame.status = 'showdown' as GameStatus;
     newGame.current_player_seat = null;
-    newGame.last_action = 'Advanced to showdown';
   }
 
   newGame.updated_at = now();
-  debugPositions(newGame);
   return newGame;
 }
+
+  
 
 export function debugPositions(state: GameState): void {
   console.table(state.players.map(p => ({

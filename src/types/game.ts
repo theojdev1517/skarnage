@@ -58,4 +58,6 @@ export interface GameState {
   side_pots: any[]; // TODO later
   action_history: any[];
   last_action: string;
+  deck: Card[];
+  deck_index: number;
 }
