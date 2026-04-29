@@ -2,100 +2,164 @@
 'use client';
 
 import { useState } from 'react';
-import { evaluateHighHand } from '@/lib/game/evaluator';
-import type { Card } from '@/types/game';
+import type { GameState } from '@/types/game';
+import * as engine from '@/lib/game/engine';
 
-export default function SkarneyTester() {
-  const [holeInput, setHoleInput] = useState('');           // ← truly empty by default
-  const [boardInput, setBoardInput] = useState('9d 4s Jh 5d Js Kc');
-  const [result, setResult] = useState<any>(null);
+type Step = 'idle' | 'dealt_holes' | 'flop' | 'turn' | 'river' | 'showdown';
 
-  const evaluate = () => {
-    const hole: Card[] = holeInput.trim() 
-      ? holeInput.trim().split(/\s+/).map(c => c.trim() as Card)
-      : [];
+export default function SkarneyHandStepper() {
+  const [game, setGame] = useState<GameState | null>(null);
+  const [step, setStep] = useState<Step>('idle');
+  const [log, setLog] = useState<string[]>([]);
+  const [deck, setDeck] = useState<string[]>([]);   // ← keep full shuffled deck
 
-    const board: Card[] = boardInput.trim().split(/\s+/).map(c => c.trim() as Card);
-
-    const evalResult = evaluateHighHand(hole, board);
-    setResult(evalResult);
-    console.log('🔍 Evaluation:', evalResult);
+  const addLog = (msg: string) => {
+    setLog(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
   };
 
-  const runSanityTests = () => {
-    const tests = [
-      { name: "Royal Flush", hole: ["Ah", "Kh"], board: ["Qh", "Jh", "10h", "2s", "3d", "4c"] },
-      { name: "Wheel Straight", hole: ["5h", "4d"], board: ["3c", "2s", "As", "Ks", "Qs", "Jd"] },
-      { name: "Board Only - Three Jacks", hole: [], board: ["9d", "4s", "Jh", "5d", "Js", "Kc"] },
-      { name: "Dead Hand", hole: ["Ah"], board: ["2s", "3d", "4c", "5h", "6s", "7d"] },
-      { name: "Full House", hole: ["Ah", "As"], board: ["Ac", "Kd", "Ks", "Qh", "Jh"] },
-    ];
+  const startNewHand = () => {
+    let g = engine.createNewGame("test-host", "Theo");
+    g = engine.joinSeat(g, "p2", 2, "Alice");
+    g = engine.joinSeat(g, "p3", 3, "Bob");
 
-    console.group('🔥 Skarney Evaluator Sanity Tests');
-    tests.forEach(t => {
-      const res = evaluateHighHand(t.hole, t.board);
-      console.log(`${t.name}: ${res.rank} → ${res.description} (score: ${res.score})`);
-    });
-    console.groupEnd();
+    const fullDeck = engine.shuffleDeck(engine.createStandardDeck());
+    setDeck(fullDeck);
+
+    g = engine.dealHoleCards(g, fullDeck);   // uses first 15 cards
+
+    setGame(g);
+    setStep('dealt_holes');
+    setLog([]);
+    addLog("New hand started — 3 players");
+    addLog(`Hole cards dealt (${g.players.length} players)`);
+  };
+
+  const nextStep = () => {
+    if (!game || deck.length === 0) return;
+
+    let newGame = { ...game };
+    let newDeckIndex = 15; // after hole cards
+
+    if (step === 'dealt_holes') {
+      newGame = engine.dealFlop(newGame, deck, newDeckIndex);
+      setStep('flop');
+      addLog("Flop + shredder dealt + auto-shred");
+    } 
+    else if (step === 'flop') {
+      newGame = engine.dealTurn(newGame, deck, newDeckIndex + 6);
+      setStep('turn');
+      addLog("Turn + shredder dealt + auto-shred");
+    } 
+    else if (step === 'turn') {
+      newGame = engine.dealRiver(newGame, deck, newDeckIndex + 8);
+      setStep('river');
+      addLog("River + shredder dealt + auto-shred");
+    } 
+    else if (step === 'river') {
+      newGame = { 
+        ...newGame, 
+        pot: 8250, 
+        status: "showdown" as any 
+      };
+      setStep('showdown');
+      addLog("=== SHOWDOWN ===");
+      
+      const result = engine.determineShowdown(newGame);
+      addLog(`High: ${result.highWinners.map(p => p.display_name).join(', ') || 'None'}`);
+      addLog(`Low:  ${result.lowWinners.map(p => p.display_name).join(', ') || 'None'}`);
+    } 
+    else if (step === 'showdown') {
+      newGame = engine.awardPot(newGame);
+      setStep('idle');
+      addLog("Pot awarded — hand complete");
+    }
+
+    setGame(newGame);
+  };
+
+  const reset = () => {
+    setGame(null);
+    setStep('idle');
+    setLog([]);
+    setDeck([]);
   };
 
   return (
     <div className="min-h-screen bg-zinc-950 text-white p-8 font-mono">
-      <div className="max-w-2xl mx-auto">
-        <h1 className="text-4xl font-bold mb-2">Skarney Poker — Hand Evaluator Tester</h1>
-        <p className="text-zinc-400 mb-8">Leave Hole Cards blank for board-only / post-shred tests</p>
+      <div className="max-w-4xl mx-auto">
+        <h1 className="text-4xl font-bold mb-2">Skarney Hand Stepper</h1>
+        <p className="text-zinc-400 mb-8">Step through a complete hand — no duplicate cards</p>
 
-        <div className="space-y-6">
-          <div>
-            <label className="block text-sm mb-2">Hole Cards (space separated — leave blank for board-only)</label>
-            <input
-              type="text"
-              value={holeInput}
-              onChange={(e) => setHoleInput(e.target.value)}
-              className="w-full bg-zinc-900 border border-zinc-700 rounded px-4 py-3 text-lg font-mono"
-              placeholder="Ah Ks Qd Jc 10h"
-            />
-          </div>
-
-          <div>
-            <label className="block text-sm mb-2">Top Board (6 cards)</label>
-            <input
-              type="text"
-              value={boardInput}
-              onChange={(e) => setBoardInput(e.target.value)}
-              className="w-full bg-zinc-900 border border-zinc-700 rounded px-4 py-3 text-lg font-mono"
-              placeholder="9d 4s Jh 5d Js Kc"
-            />
-          </div>
-
-          <div className="flex gap-4">
-            <button 
-              onClick={evaluate} 
-              className="flex-1 bg-white text-black font-semibold py-4 rounded hover:bg-zinc-200 transition"
-            >
-              Evaluate Hand
-            </button>
-            <button 
-              onClick={runSanityTests} 
-              className="flex-1 border border-zinc-700 hover:bg-zinc-900 py-4 rounded transition"
-            >
-              Run Sanity Tests (Console)
-            </button>
-          </div>
-
-          {result && (
-            <div className="bg-zinc-900 border border-zinc-700 rounded p-6">
-              <h3 className="text-xl font-semibold mb-4">Result</h3>
-              <p className="text-3xl mb-2">{result.description}</p>
-              <p className="text-emerald-400">Rank: {result.rank}</p>
-              <p className="text-zinc-400">Score: {result.score.toLocaleString()}</p>
-              <details className="mt-4">
-                <summary className="cursor-pointer text-sm text-zinc-400">Cards used</summary>
-                <p className="mt-2 font-mono break-all">{result.cards.join(' ')}</p>
-              </details>
-            </div>
-          )}
+        <div className="flex gap-4 mb-8">
+          <button onClick={startNewHand} className="bg-white text-black px-6 py-3 rounded font-semibold hover:bg-zinc-200">
+            Start New Hand
+          </button>
+          <button 
+            onClick={nextStep} 
+            disabled={!game || step === 'idle'}
+            className="bg-emerald-600 hover:bg-emerald-500 disabled:bg-zinc-700 px-6 py-3 rounded font-semibold"
+          >
+            Next Step →
+          </button>
+          <button onClick={reset} className="border border-zinc-700 hover:bg-zinc-900 px-6 py-3 rounded">
+            Reset
+          </button>
         </div>
+
+        {game && (
+          <div className="space-y-8">
+            <div className="flex justify-between bg-zinc-900 border border-zinc-700 p-4 rounded">
+              <div>Current Step: <span className="text-emerald-400 font-bold">{step.toUpperCase().replace('_', ' ')}</span></div>
+              <div>Pot: <span className="font-mono">${game.pot}</span></div>
+            </div>
+
+            {/* Players */}
+<div>
+  <h3 className="text-lg mb-3">Players</h3>
+  {game.players.map(p => (
+    <div key={p.seat} className="bg-zinc-900 border border-zinc-700 p-4 mb-3 rounded">
+      <div className="flex justify-between items-start">
+        <strong>{p.display_name} (Seat {p.seat})</strong>
+        <span className="text-right">Stack: ${p.stack}</span>
+      </div>
+      
+      <div className="mt-3 text-sm font-mono space-y-1 text-zinc-300">
+        <div>
+          Original Hole: <span className="text-white">{p.hole_cards.join(' ')}</span>
+        </div>
+        <div>
+          Live Cards: <span className={p.live_hole_cards.length === 0 ? "line-through text-zinc-500" : "text-emerald-400"}>
+            {p.live_hole_cards.join(' ') || '(all shredded — dead hand)'}
+          </span>
+        </div>
+        <div>
+          Shredded: <span className="text-amber-400">{p.shredded_cards.join(' ') || '(none yet)'}</span>
+        </div>
+        <div className="text-zinc-400">
+          Current Pip Total: <span className="font-semibold">{p.current_pip_total}</span>
+        </div>
+      </div>
+    </div>
+  ))}
+</div>
+
+            {/* Board */}
+            {game.board.top.some(Boolean) && (
+              <div className="bg-zinc-900 border border-zinc-700 p-6 rounded">
+                <h3 className="mb-3">Top Board</h3>
+                <p className="font-mono text-xl tracking-widest">{game.board.top.filter(Boolean).join(' ')}</p>
+                <h3 className="mt-6 mb-3 text-sm text-zinc-400">Shredder Board</h3>
+                <p className="font-mono text-lg text-zinc-500">{game.board.shredder.filter(Boolean).join(' ')}</p>
+              </div>
+            )}
+
+            {/* Log */}
+            <div className="bg-zinc-900 border border-zinc-700 p-6 rounded max-h-96 overflow-auto text-sm">
+              <h3 className="mb-3">Hand Log</h3>
+              {log.map((line, i) => <div key={i} className="py-0.5">{line}</div>)}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
