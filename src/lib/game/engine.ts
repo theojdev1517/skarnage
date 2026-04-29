@@ -414,3 +414,43 @@ export function awardPot(game: GameState): GameState {
     last_action: `Hand complete. High: ${result.highWinners.length} winner(s) | Low: ${result.lowWinners.length} winner(s)`,
   };
 }
+/**
+ * Reset game state for the next hand.
+ * Call this after awardPot() when players want to play another hand.
+ */
+export function nextHand(game: GameState): GameState {
+  const newHandNumber = game.hand_number + 1;
+
+  const resetPlayers = game.players.map(player => ({
+    ...player,
+    hole_cards: [],
+    live_hole_cards: [],
+    shredded_cards: [],
+    contributed_this_hand: 0,
+    bet_this_street: 0,
+    discard_submitted: false,
+    status: "active" as const,
+    current_pip_total: 0,
+    final_pip_total: null,
+    hand_result: null,
+  }));
+
+  return {
+    ...game,
+    hand_number: newHandNumber,
+    status: "waiting" as GameStatus,
+    pot: 0,
+    current_wager: 0,
+    min_raise: 0,
+    board: {
+      top: [null, null, null, null, null, null],
+      shredder: [null, null, null, null, null, null]
+    },
+    players: resetPlayers,
+    current_player_seat: null,
+    last_aggressor_seat: null,
+    action_history: [],
+    last_action: `Hand ${newHandNumber} started — ready to deal`,
+    updated_at: now(),
+  };
+}
