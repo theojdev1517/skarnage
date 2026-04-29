@@ -8,13 +8,13 @@ export type HandRank =
 
 export interface HandEvaluation {
   rank: HandRank;
-  score: number;           // Higher = better (direct comparison)
-  cards: Card[];           // The exact 5 cards that make the hand
+  score: number;
+  cards: Card[];
   description: string;
 }
 
 const RANK_ORDER = "23456789TJQKA";
-const RANK_VALUE = new Map(RANK_ORDER.split('').map((r, i) => [r, i + 2])); // 2→2 ... A→14
+const RANK_VALUE = new Map(RANK_ORDER.split('').map((r, i) => [r, i + 2]));
 
 function parseCardRank(card: Card): string {
   let rank = card.slice(0, -1);
@@ -25,12 +25,22 @@ function getRankValue(card: Card): number {
   return RANK_VALUE.get(parseCardRank(card))!;
 }
 
-function getSuit(card: Card): string {
-  return card.slice(-1);
+function getSuitValue(card: Card): number {
+  const suit = card.slice(-1);
+  return "hdcs".indexOf(suit); // deterministic tiebreaker
 }
 
-// Brute-force combinations (C(11,5) = 462 — negligible)
+// Stronger, stable sort for best hand selection
+function sortCardsDescending(cards: Card[]): Card[] {
+  return [...cards].sort((a, b) => {
+    const rankDiff = getRankValue(b) - getRankValue(a);
+    if (rankDiff !== 0) return rankDiff;
+    return getSuitValue(b) - getSuitValue(a); // stable
+  });
+}
+
 function* combinations<T>(arr: T[], k: number): Generator<T[]> {
+  // ... (keep your existing combinations generator - it's fine)
   const n = arr.length;
   if (k > n || k === 0) return;
   const indices = Array.from({ length: k }, (_, i) => i);
@@ -48,23 +58,20 @@ function* combinations<T>(arr: T[], k: number): Generator<T[]> {
   }
 }
 
-// Rank a single 5-card hand
 function rankFiveCards(cards: Card[]): { rank: HandRank; score: number; cards: Card[] } {
-  const sorted = [...cards].sort((a, b) => getRankValue(b) - getRankValue(a));
+  const sorted = sortCardsDescending(cards);
   const ranks = sorted.map(parseCardRank);
-  const suits = sorted.map(getSuit);
+  const suits = sorted.map(c => c.slice(-1));
 
   const isFlush = new Set(suits).size === 1;
 
-  // Straight (including wheel A-5)
-  const uniqueRankVals = [...new Set(ranks.map(r => RANK_VALUE.get(r)!))].sort((a, b) => b - a);
+  const uniqueVals = [...new Set(ranks.map(r => RANK_VALUE.get(r)!))].sort((a, b) => b - a);
   let isStraight = false;
-  if (uniqueRankVals.length === 5) {
-    if (uniqueRankVals[0] - uniqueRankVals[4] === 4) isStraight = true;
-    else if (uniqueRankVals.join(',') === '14,5,4,3,2') isStraight = true; // Wheel
+  if (uniqueVals.length === 5) {
+    if (uniqueVals[0] - uniqueVals[4] === 4) isStraight = true;
+    else if (uniqueVals.join(',') === '14,5,4,3,2') isStraight = true;
   }
 
-  // Frequency
   const freq = new Map<string, number>();
   ranks.forEach(r => freq.set(r, (freq.get(r) || 0) + 1));
   const freqSorted = Array.from(freq.values()).sort((a, b) => b - a);
@@ -99,7 +106,6 @@ function rankFiveCards(cards: Card[]): { rank: HandRank; score: number; cards: C
     baseScore = 1_000_000;
   }
 
-  // Kicker tiebreaker
   const kickerScore = sorted.reduce((acc, card, idx) => 
     acc + getRankValue(card) * Math.pow(15, 4 - idx), 0
   );
@@ -111,7 +117,6 @@ function rankFiveCards(cards: Card[]): { rank: HandRank; score: number; cards: C
   };
 }
 
-// Main entry point
 export function evaluateHighHand(holeCards: Card[], communityCards: Card[]): HandEvaluation {
   const allCards = [...holeCards, ...communityCards].filter(Boolean) as Card[];
 
