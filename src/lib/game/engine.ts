@@ -296,3 +296,121 @@ export function evaluatePlayerHand(player: Player, topBoard: (Card | null)[]): H
   const community = topBoard.filter((c): c is Card => c !== null);
   return evaluateHighHand(liveCards, community);
 }
+// ─────────────────────────────────────────────────────────────
+// Showdown & Pot Awarding
+// ─────────────────────────────────────────────────────────────
+
+export interface ShowdownResult {
+  highWinners: Player[];
+  lowWinners: Player[];
+  highEvaluation?: HandEvaluation;
+  lowPips: number;
+  highPotShare: number;
+  lowPotShare: number;
+}
+
+/**
+ * Determines high and low winners.
+ * 0 live cards = dead hand (filtered out).
+ */
+export function determineShowdown(game: GameState): ShowdownResult {
+  const activePlayers = game.players.filter(
+    (p) => p.status === "active" && p.live_hole_cards.length > 0
+  );
+
+  if (activePlayers.length === 0) {
+    return {
+      highWinners: [],
+      lowWinners: [],
+      lowPips: Infinity,
+      highPotShare: 0,
+      lowPotShare: 0,
+    };
+  }
+
+  let bestHighScore = -1;
+  let highWinners: Player[] = [];
+  let bestLow = Infinity;
+  let lowWinners: Player[] = [];
+  let bestHighEval: HandEvaluation | undefined;
+
+  for (const player of activePlayers) {
+    const highEval = evaluatePlayerHand(player, game.board.top);
+    const lowPips = player.current_pip_total;
+
+    // High hand
+    if (highEval.score > bestHighScore) {
+      highWinners = [player];
+      bestHighScore = highEval.score;
+      bestHighEval = highEval;
+    } else if (highEval.score === bestHighScore) {
+      highWinners.push(player);
+    }
+
+    // Low hand (lower pips = better)
+    if (lowPips < bestLow) {
+      lowWinners = [player];
+      bestLow = lowPips;
+    } else if (lowPips === bestLow) {
+      lowWinners.push(player);
+    }
+  }
+
+  const totalPot = game.pot;
+  const highShare = Math.floor(totalPot / 2);
+  const lowShare = totalPot - highShare;
+
+  return {
+    highWinners,
+    lowWinners,
+    highEvaluation: bestHighEval,
+    lowPips: bestLow,
+    highPotShare: highShare,
+    lowPotShare: lowShare,
+  };
+}
+
+/**
+ * Awards pot and updates player stacks.
+ * Call this when the hand reaches showdown.
+ */
+export function awardPot(game: GameState): GameState {
+  const result = determineShowdown(game);
+  const updatedPlayers = [...game.players];
+
+  const highWinnersSet = new Set(result.highWinners.map((p) => p.user_id));
+  const lowWinnersSet = new Set(result.lowWinners.map((p) => p.user_id));
+
+  for (let i = 0; i < updatedPlayers.length; i++) {
+    const p = updatedPlayers[i];
+    let winnings = 0;
+
+    if (highWinnersSet.has(p.user_id)) {
+      winnings += Math.floor(result.highPotShare / result.highWinners.length);
+    }
+    if (lowWinnersSet.has(p.user_id)) {
+      winnings += Math.floor(result.lowPotShare / result.lowWinners.length);
+    }
+
+    if (winnings > 0) {
+      updatedPlayers[i] = {
+        ...p,
+        stack: p.stack + winnings,
+        hand_result: {
+          high: result.highEvaluation,
+          lowPips: p.current_pip_total,
+          winnings,
+        },
+      };
+    }
+  }
+
+  return {
+    ...game,
+    players: updatedPlayers,
+    pot: 0,
+    status: "finished" as GameStatus,
+    updated_at: now(),
+    last_action: `Hand complete. High: ${result.highWinners.length} winner(s) | Low: ${result.lowWinners.length} winner(s)`,
+  };
+}
