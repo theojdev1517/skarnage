@@ -122,17 +122,26 @@ export function shredCards(game: GameState): GameState {
 
   const updatedPlayers = game.players.map(player => {
     if (player.status !== "active") return player;
+
     const remaining: Card[] = [];
     const shreddedThisStreet: Card[] = [];
+
     for (const card of player.live_hole_cards) {
-      if (shredderRanks.has(parseCardRank(card))) shreddedThisStreet.push(card);
-      else remaining.push(card);
+      if (shredderRanks.has(parseCardRank(card))) {
+        shreddedThisStreet.push(card);
+      } else {
+        remaining.push(card);
+      }
     }
+
+    const newStatus: "active" | "dead" = remaining.length === 0 ? "dead" : "active";
+
     return {
       ...player,
       live_hole_cards: remaining,
       shredded_cards: [...player.shredded_cards, ...shreddedThisStreet],
       current_pip_total: calculatePipTotal(remaining),
+      status: newStatus,                    // ← now properly typed
     };
   });
 
@@ -378,7 +387,9 @@ export interface ShowdownResult {
 }
 
 export function determineShowdown(game: GameState): ShowdownResult {
-  const activePlayers = game.players.filter(p => p.status === "active" && p.live_hole_cards.length > 0);
+  const activePlayers = game.players.filter(p => 
+    isHandLive(p) && p.live_hole_cards.length > 0
+  );
   if (activePlayers.length === 0) return { highWinners: [], lowWinners: [], lowPips: Infinity, highPotShare: 0, lowPotShare: 0 };
 
   let bestHighScore = -1;
@@ -696,25 +707,33 @@ export function startNewHand(state: GameState): GameState {
 export function advanceToNextPhase(game: GameState): GameState {
   let newGame = { ...game };
 
+  // Reset per-street betting
   newGame.players = newGame.players.map(p => ({ ...p, bet_this_street: 0 }));
   newGame.current_wager = 0;
   newGame.last_aggressor_seat = null;
 
-  if (newGame.status === 'preflop_betting' || newGame.status === 'dealt_holes') {
+  if (['preflop_betting', 'dealt_holes', 'waiting'].includes(newGame.status)) {
     newGame = dealFlop(newGame);
     newGame.current_player_seat = getFirstToAct(newGame, 'postflop');
     newGame.status = 'flop_betting' as GameStatus;
+    newGame.last_action = 'Flop dealt + auto-shred';
+
   } else if (newGame.status === 'flop_betting') {
     newGame = dealTurn(newGame);
     newGame.current_player_seat = getFirstToAct(newGame, 'postflop');
     newGame.status = 'turn_betting' as GameStatus;
+    newGame.last_action = 'Turn dealt + auto-shred';
+
   } else if (newGame.status === 'turn_betting') {
     newGame = dealRiver(newGame);
     newGame.current_player_seat = getFirstToAct(newGame, 'postflop');
     newGame.status = 'river_betting' as GameStatus;
+    newGame.last_action = 'River dealt + auto-shred';
+
   } else if (newGame.status === 'river_betting') {
     newGame.status = 'showdown' as GameStatus;
     newGame.current_player_seat = null;
+    newGame.last_action = 'Advanced to showdown';
   }
 
   newGame.updated_at = now();
@@ -731,4 +750,12 @@ export function debugPositions(state: GameState): void {
     Button: p.seat === state.button_seat ? 'BUTTON' : '',
     CurrentAction: p.seat === state.current_player_seat ? '← ACTING' : '',
   })));
+}
+
+export function isHandLive(player: Player): boolean {
+  return player.status === "active" || player.status === "all_in";
+}
+
+export function isDeadHand(player: Player): boolean {
+  return player.live_hole_cards.length === 0 || player.status === "dead";
 }

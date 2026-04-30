@@ -28,7 +28,7 @@ export interface Player {
   live_hole_cards: Card[];      // after shredding
   shredded_cards: Card[];
   discard_submitted: boolean;
-  status: "active" | "folded" | "all_in";
+  status: "active" | "folded" | "all_in" | "dead";
   current_pip_total: number;
   final_pip_total: number | null;
   hand_result: any; // TODO: we'll define proper hand result later

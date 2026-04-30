@@ -1,5 +1,5 @@
 // src/lib/game/evaluator.ts
-import type { Card } from "@/types/game";
+import type { Card, Player } from '@/types/game';
 
 export type HandRank = 
   | "high_card" | "pair" | "two_pair" | "three_kind" 
