@@ -1,7 +1,7 @@
 // app/api/game/[gameId]/action/route.ts
 import { NextRequest, NextResponse } from 'next/server';
-import type { GameState } from '../src/types/game';
-import * as engine from '../src/lib/game/engine';
+import type { GameState } from '@/types/game';
+import * as engine from '@/lib/game/engine';
 
 export async function POST(
   request: NextRequest,

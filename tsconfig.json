@@ -19,11 +19,9 @@
     "incremental": true,
     "baseUrl": ".",
     "paths": {
-      "@/*": [
-        "./*"
-      ]
+      "@/*": [ "./src/*"  ]
     },
-    "ignoreDeprecations": "6.0", // ← Add this line
+    // "ignoreDeprecations": "6.0", // ← Add this line
     "plugins": [
       {
         "name": "next"

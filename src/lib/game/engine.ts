@@ -1,7 +1,7 @@
 // src/lib/game/engine.ts
 import type { GameState, Player, Card, GameStatus } from "@/types/game";
 import type { HandEvaluation } from "./evaluator";
-import { evaluateHighHand } from "./evaluator";
+import { evaluateHighHand, parseCardRank } from "./evaluator";   // add parseCardRank
 
 export function now(): string {
   return new Date().toISOString();
@@ -88,12 +88,6 @@ export function createStandardDeck(): Card[] {
   const deck: Card[] = [];
   for (const suit of suits) for (const rank of ranks) deck.push(`${rank}${suit}` as Card);
   return deck;
-}
-
-export function parseCardRank(card: Card): string {
-  if (typeof card !== 'string') return '';
-  let rank = card.slice(0, -1);
-  return rank === "10" ? "T" : rank;
 }
 
 export function calculatePipTotal(cards: Card[]): number {
@@ -253,17 +247,7 @@ export function getNextPlayerSeat(game: GameState, currentSeat: number): number 
 }
 
 export function isBettingRoundComplete(game: GameState): boolean {
-  console.log("=== BETTING COMPLETE CHECK ===", {
-  currentWager: game.current_wager,
-  lastAggressor: game.last_aggressor_seat,
-  currentPlayer: game.current_player_seat,
-  players: game.players.map(p => ({
-    seat: p.seat,
-    bet: p.bet_this_street,
-    stack: p.stack,
-    matched: p.bet_this_street >= (game.current_wager || 0)
-  }))
-});
+  
   const activePlayers = game.players.filter(p => p.status === "active");
   if (activePlayers.length <= 1) return true;
 
@@ -346,6 +330,8 @@ export function processBet(
       stack: player.stack - actual,
     };
 
+    lastActionText = `${player.display_name} raised to $${player.bet_this_street + actual}`;
+/*
     return {
   ...game,
   players: updatedPlayers,
@@ -354,8 +340,7 @@ export function processBet(
   last_aggressor_seat: seat,
   current_player_seat: getNextActiveSeat(game, seat),
   updated_at: now(),
-  last_action: `${player.display_name} raised to $${player.bet_this_street + actual}`,
-};
+  last_action: `${player.display_name} raised to $${player.bet_this_street + actual}`, }; */
   }
 
   // For fold / check / call — advance to next player
@@ -497,7 +482,8 @@ export function nextHand(game: GameState): GameState {
   };
 }
 
-export function advanceStreet(game: GameState): GameState {
+// probably not needed from an older iteration
+/* export function advanceStreet(game: GameState): GameState {
   let newGame = { ...game };
 
   // Reset street bets
@@ -535,6 +521,7 @@ export function advanceStreet(game: GameState): GameState {
   newGame.updated_at = now();
   return newGame;
 }
+  */
 
 // ======================
 // NEW: BUTTON ROTATION + BLIND POSTING (pure functions added at the end)
@@ -738,18 +725,6 @@ export function advanceToNextPhase(game: GameState): GameState {
 
   newGame.updated_at = now();
   return newGame;
-}
-
-  
-
-export function debugPositions(state: GameState): void {
-  console.table(state.players.map(p => ({
-    Seat: p.seat,
-    Name: p.display_name,
-    Status: p.status,
-    Button: p.seat === state.button_seat ? 'BUTTON' : '',
-    CurrentAction: p.seat === state.current_player_seat ? '← ACTING' : '',
-  })));
 }
 
 export function isHandLive(player: Player): boolean {

@@ -16,7 +16,7 @@ export interface HandEvaluation {
 const RANK_ORDER = "23456789TJQKA";
 const RANK_VALUE = new Map(RANK_ORDER.split('').map((r, i) => [r, i + 2]));
 
-function parseCardRank(card: Card): string {
+export function parseCardRank(card: Card): string {
   let rank = card.slice(0, -1);
   return rank === "10" ? "T" : rank;
 }
