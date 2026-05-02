@@ -1,32 +1,58 @@
 'use client';
 
-import { useParams } from 'next/navigation';
-import { useGameState } from '@/hooks/useGameState';
+import { useState } from 'react';
+import { createClient } from '@/lib/supabase';
+import * as engine from '@/lib/game/engine';
 
-export default function GamePage() {
-  const { gameId } = useParams<{ gameId: string }>();
-  const { game, loading } = useGameState(gameId || '');
+export default function Home() {
+  const [loading, setLoading] = useState(false);
+  const supabase = createClient();
 
-  // TEMPORARY: Show dummy game so you can see the UI tonight
-  const displayGame = game || {
-    game_id: gameId,
-    status: 'waiting',
-    pot: 0,
-    players: [],
-    board: { top: [], shredder: [] },
+  const createNewGame = async () => {
+    setLoading(true);
+
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) {
+      await supabase.auth.signInAnonymously();
+    }
+
+    const gameId = crypto.randomUUID();
+
+    try {
+      const initialState = engine.createNewGame(user?.id || 'anonymous', 'Theo'); // use your engine!
+      const { error } = await supabase
+        .from('games')
+        .insert({ 
+          id: gameId, 
+          game_state: initialState, 
+          host_id: user?.id, 
+          status: 'waiting' 
+        });
+
+      if (error) console.error('Insert error:', error);
+      else console.log('✅ Game saved to Supabase');
+    } catch (e) {
+      console.error('Create error:', e);
+    }
+
+    window.location.href = `/game/${gameId}`;
   };
 
-  if (loading) return <div className="p-8 text-center text-white">Loading table...</div>;
-
   return (
-    <div className="min-h-screen bg-[#0a1f0a] p-4 text-white">
-      <div className="max-w-7xl mx-auto">
-        <h1 className="text-3xl mb-6 text-emerald-400">Skarney • Table {gameId}</h1>
-        <p className="text-yellow-400 mb-4">✅ Game page is now rendering (dummy data for tonight)</p>
-        
-        <pre className="bg-black/50 p-6 rounded text-sm overflow-auto max-h-[80vh]">
-          {JSON.stringify(displayGame, null, 2)}
-        </pre>
+    <div className="min-h-screen flex items-center justify-center bg-[#0a1f0a]">
+      <div className="text-center">
+        <h1 className="text-7xl font-bold mb-8 text-emerald-400 tracking-wider">SKARNEY</h1>
+        <p className="text-xl text-gray-300 mb-12 max-w-md mx-auto">
+          Friends-only Icelandic poker with automatic shredding
+        </p>
+
+        <button
+          onClick={createNewGame}
+          disabled={loading}
+          className="px-12 py-5 bg-emerald-600 hover:bg-emerald-500 text-2xl font-semibold rounded-xl transition-all disabled:opacity-50"
+        >
+          {loading ? 'Creating Table...' : 'Create New Game'}
+        </button>
       </div>
     </div>
   );
