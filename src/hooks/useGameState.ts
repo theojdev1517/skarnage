@@ -18,11 +18,11 @@ export function useGameState(gameId: string) {
     const fetchGame = async () => {
       const { data } = await supabase
         .from('games')
-        .select('*')
+        .select('game_state')
         .eq('id', gameId)
         .single();
 
-      setGame(data as GameState);
+      setGame(data?.game_state as GameState);
       setLoading(false);
     };
 
@@ -33,8 +33,8 @@ export function useGameState(gameId: string) {
       .channel(`game:${gameId}`)
       .on(
         'postgres_changes',
-        { event: '*', schema: 'public', table: 'games', filter: `game_id=eq.${gameId}` },
-        (payload) => setGame(payload.new as GameState)
+        { event: '*', schema: 'public', table: 'games', filter: `id=eq.${gameId}` },
+        (payload) => setGame((payload.new as any)?.game_state as GameState)
       )
       .subscribe();
 
