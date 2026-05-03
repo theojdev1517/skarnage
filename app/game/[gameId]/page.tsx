@@ -8,10 +8,18 @@ export default function GamePage() {
   const { gameId } = useParams<{ gameId: string }>();
   const { game, loading } = useGameState(gameId || '');
 
-  const joinSeat = (seat: number) => {
-    const name = prompt('Enter your display name:') || 'Player';
-    alert(`Joining seat ${seat} as ${name} - backend coming soon`);
-  };
+     const joinSeat = async (seat: number) => {
+  const name = prompt('Enter your display name:') || 'Player';
+  try {
+    const { joinSeat: joinAction } = await import('./actions');
+    await joinAction(gameId, seat, name);
+    // No reload — realtime will push the update instantly
+  } catch (e) {
+    console.error(e);
+    alert('Join failed');
+  }
+};
+
 
   if (loading) return <div className="p-8 text-center">Loading table...</div>;
   if (!game) return <div className="p-8 text-center">Game not found</div>;
@@ -54,39 +62,40 @@ export default function GamePage() {
           </div>
         </div>
 
-                {/* 8 Seats around oval table */}
-        <div className="relative w-full max-w-5xl mx-auto h-[460px] bg-emerald-950 rounded-full border-8 border-emerald-800 mb-12">
-          {[1,2,3,4,5,6,7,8].map((seat) => {
-            const player = game.players.find(p => p.seat === seat);
-            const angle = (seat - 1) * (360 / 8) - 90; // start at top
-            const radiusX = 42; // % 
-            const radiusY = 35;
+           {/* 8 Seats around oval table */}
+<div className="relative w-full max-w-5xl mx-auto h-[460px] bg-emerald-950 rounded-full border-8 border-emerald-800 mb-12">
+  {[1,2,3,4,5,6,7,8].map((seat) => {
+    const player = game.players?.find(p => p.seat === seat);
 
-            return (
-              <div 
-                key={seat}
-                className="absolute w-28 h-20 bg-zinc-900 border-2 border-zinc-700 rounded-2xl flex items-center justify-center text-center cursor-pointer hover:border-amber-400 hover:scale-105 transition-all shadow-lg"
-                style={{
-                  left: `calc(50% + ${radiusX * Math.cos((angle * Math.PI) / 180)}%)`,
-                  top: `calc(50% + ${radiusY * Math.sin((angle * Math.PI) / 180)}%)`,
-                  transform: 'translate(-50%, -50%)',
-                }}
-                onClick={() => joinSeat(seat)}
-              >
-                {player ? (
-                  <div className="text-xs p-1">
-                    <div className="font-bold">{player.display_name}</div>
-                    <div>${player.stack}</div>
-                  </div>
-                ) : (
-                  <div className="text-zinc-400 text-xs leading-tight">
-                    Seat {seat}<br/>Empty<br/>Click to Join
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
+    const angle = (seat - 1) * (360 / 8) - 90;
+    const radiusX = 42;
+    const radiusY = 35;
+
+    return (
+      <div 
+        key={seat}
+        className="absolute w-28 h-20 bg-zinc-900 border-2 border-zinc-700 rounded-2xl flex items-center justify-center text-center cursor-pointer hover:border-amber-400 hover:scale-105 transition-all shadow-lg"
+        style={{
+          left: `calc(50% + ${radiusX * Math.cos((angle * Math.PI) / 180)}%)`,
+          top: `calc(50% + ${radiusY * Math.sin((angle * Math.PI) / 180)}%)`,
+          transform: 'translate(-50%, -50%)',
+        }}
+        onClick={() => joinSeat(seat)}
+      >
+        {player ? (
+          <div className="text-xs p-1">
+            <div className="font-bold">{player.display_name}</div>
+            <div>${(player.stack / 100).toFixed(2)}</div> {/* nicer cents display */}
+          </div>
+        ) : (
+          <div className="text-zinc-400 text-xs leading-tight">
+            Seat {seat}<br/>Empty<br/>Click to Join
+          </div>
+        )}
+      </div>
+    );
+  })}
+</div>
 
         {/* Action Bar (placeholder) */}
         <div className="bg-zinc-900 p-6 rounded-xl">
