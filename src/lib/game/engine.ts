@@ -201,38 +201,57 @@ export function dealFlop(game: GameState): GameState {
   newGame = shredCards(newGame);
   newGame.last_action = "Flop dealt + auto-shred";
 
+  newGame.last_action += ` | Pot: $${(newGame.pot / 100).toFixed(2)}`;
+
   return newGame;
 }
 
 export function dealTurn(game: GameState): GameState {
-  let newGame = { ...game };
-  let idx = newGame.deck_index;
+  let idx = game.deck_index;
 
-  newGame.board = {
-    top: [...newGame.board.top.slice(0, 3), newGame.deck[idx], null, null],
-    shredder: [...newGame.board.shredder.slice(0, 3), newGame.deck[idx + 1], null, null]
+  // Turn = 2 cards to top board + 2 cards to shredder board
+  const topTurn1 = game.deck[idx];
+  const topTurn2 = game.deck[idx + 1];
+  const shredTurn1 = game.deck[idx + 2];
+  const shredTurn2 = game.deck[idx + 3];
+
+  let newGame = {
+    ...game,
+    board: {
+      top: [...game.board.top.slice(0, 3), topTurn1, topTurn2, null],
+      shredder: [...game.board.shredder.slice(0, 3), shredTurn1, shredTurn2, null],
+    },
+    deck_index: idx + 4,
   };
 
-  newGame.deck_index = idx + 2;
   newGame = shredCards(newGame);
-  newGame.last_action = "Turn dealt + auto-shred";
+  newGame.status = "turn_betting" as GameStatus;
+  newGame.last_action = "Turn dealt (2+2 cards) + auto-shred";
+  newGame.updated_at = now();
 
   return newGame;
 }
 
 export function dealRiver(game: GameState): GameState {
-  let newGame = { ...game };
-  let idx = newGame.deck_index;
+  let idx = game.deck_index;
 
-  newGame.board = {
-    top: [...newGame.board.top.slice(0, 4), newGame.deck[idx]],
-    shredder: [...newGame.board.shredder.slice(0, 4), newGame.deck[idx + 1]]
+  // River = 1 card to top board + 1 card to shredder board
+  const topRiver = game.deck[idx];
+  const shredderRiver = game.deck[idx + 1];
+
+  let newGame = {
+    ...game,
+    board: {
+      top: [...game.board.top.slice(0, 5), topRiver],           // ← was slice(0,4)
+      shredder: [...game.board.shredder.slice(0, 5), shredderRiver], // ← was slice(0,4)
+    },
+    deck_index: idx + 2,
   };
 
-  newGame.deck_index = idx + 2;
   newGame = shredCards(newGame);
-  newGame.status = 'river_betting' as GameStatus;
-  newGame.last_action = "River dealt + auto-shred";
+  newGame.status = "river_betting" as GameStatus;
+  newGame.last_action = "River dealt (1+1 cards) + auto-shred";
+  newGame.updated_at = now();
 
   return newGame;
 }
@@ -247,26 +266,20 @@ export function getNextPlayerSeat(game: GameState, currentSeat: number): number 
 }
 
 export function isBettingRoundComplete(game: GameState): boolean {
-  
-  const activePlayers = game.players.filter(p => p.status === "active");
-  if (activePlayers.length <= 1) return true;
+  const active = game.players.filter((p) => p.status === "active" || p.status === "all_in");
+  if (active.length <= 1) return true;
 
   const currentWager = game.current_wager || 0;
 
-  // 1. Everyone must have matched the current wager or be all-in
-  const everyoneMatched = activePlayers.every(p => 
+  const everyoneMatchedOrAllIn = active.every((p) =>
     p.bet_this_street >= currentWager || p.stack === 0
   );
 
-  if (!everyoneMatched) return false;
+  if (!everyoneMatchedOrAllIn) return false;
 
-  // 2. If there has been a raise this street, action must have come back around
+  // Action has closed back to the last aggressor
   if (game.last_aggressor_seat !== null) {
-    // Simple but effective: if we're back to (or past) the last aggressor, round is closed
-    const current = game.current_player_seat;
-    if (current === game.last_aggressor_seat) {
-      return true;
-    }
+    return game.current_player_seat === game.last_aggressor_seat;
   }
 
   return true;
@@ -275,26 +288,26 @@ export function isBettingRoundComplete(game: GameState): boolean {
 export function processBet(
   game: GameState,
   seat: number,
-  action: "fold" | "call" | "check" | "raise",
+  action: "fold" | "check" | "call" | "raise",
   amount: number = 0
 ): GameState {
-  const playerIndex = game.players.findIndex(p => p.seat === seat);
+  const playerIndex = game.players.findIndex((p) => p.seat === seat);
   if (playerIndex === -1) throw new Error("Player not found");
 
   const player = game.players[playerIndex];
-
-  // Enforce turn
   if (seat !== game.current_player_seat) {
-    throw new Error(`Not your turn! Seat ${game.current_player_seat} should act, not seat ${seat}.`);
+    throw new Error(`Not your turn! Current seat: ${game.current_player_seat}`);
   }
-
   if (player.status !== "active") {
     throw new Error("Player cannot act");
   }
 
   const updatedPlayers = [...game.players];
+  let newWager = game.current_wager;
+  let newMinRaise = game.min_raise;
+  let newLastAggressor = game.last_aggressor_seat;
   let lastActionText = "";
-  let isAllIn = false;
+  let potAddition = 0;
 
   const toCall = game.current_wager - player.bet_this_street;
 
@@ -308,6 +321,7 @@ export function processBet(
   } 
   else if (action === "call") {
     const callAmount = Math.min(toCall, player.stack);
+    potAddition = callAmount;
     updatedPlayers[playerIndex] = {
       ...player,
       bet_this_street: player.bet_this_street + callAmount,
@@ -315,7 +329,6 @@ export function processBet(
       stack: player.stack - callAmount,
     };
     lastActionText = `${player.display_name} called $${callAmount}`;
-    if (callAmount === player.stack && player.stack > 0) isAllIn = true;
   } 
   else if (action === "raise") {
     const minRaiseAmount = game.min_raise || game.blinds.big * 2;
@@ -323,6 +336,7 @@ export function processBet(
     const raiseAmount = raiseTo - player.bet_this_street;
     const actual = Math.min(raiseAmount, player.stack);
 
+    potAddition = actual;
     updatedPlayers[playerIndex] = {
       ...player,
       bet_this_street: player.bet_this_street + actual,
@@ -330,25 +344,21 @@ export function processBet(
       stack: player.stack - actual,
     };
 
-    lastActionText = `${player.display_name} raised to $${player.bet_this_street + actual}`;
-/*
-    return {
-  ...game,
-  players: updatedPlayers,
-  current_wager: player.bet_this_street + actual,   // important: use updated amount
-  min_raise: actual,
-  last_aggressor_seat: seat,
-  current_player_seat: getNextActiveSeat(game, seat),
-  updated_at: now(),
-  last_action: `${player.display_name} raised to $${player.bet_this_street + actual}`, }; */
+    newWager = player.bet_this_street + actual;
+    newMinRaise = actual;
+    newLastAggressor = seat;
+    lastActionText = `${player.display_name} raised to $${newWager}`;
   }
 
-  // For fold / check / call — advance to next player
   const nextSeat = getNextActiveSeat(game, seat);
 
   return {
     ...game,
     players: updatedPlayers,
+    pot: game.pot + potAddition,
+    current_wager: newWager,
+    min_raise: newMinRaise,
+    last_aggressor_seat: newLastAggressor,
     current_player_seat: nextSeat,
     updated_at: now(),
     last_action: lastActionText,
@@ -556,19 +566,15 @@ export function getActivePlayers(state: GameState): Player[] {
 }
 
 export function getNextActiveSeat(state: GameState, afterSeat: number): number | null {
-  const playerCount = state.players.length;
-  if (playerCount === 0) return null;
+  const activePlayers = state.players
+    .filter((p) => p.status === "active" || p.status === "all_in")
+    .sort((a, b) => a.seat - b.seat);
 
-  const startIndex = state.players.findIndex(p => p.seat === afterSeat);
-  if (startIndex === -1) return state.players.find(p => isActive(p))?.seat ?? null;
+  if (activePlayers.length === 0) return null;
 
-  for (let i = 1; i <= playerCount; i++) {
-    const nextIndex = (startIndex + i) % playerCount;
-    if (isActive(state.players[nextIndex])) {
-      return state.players[nextIndex].seat;
-    }
-  }
-  return null;
+  const idx = activePlayers.findIndex((p) => p.seat === afterSeat);
+  if (idx === -1) return activePlayers[0].seat;
+  return activePlayers[(idx + 1) % activePlayers.length].seat;
 }
 
 export function rotateButton(state: GameState): GameState {
@@ -655,36 +661,48 @@ export function postBlinds(state: GameState): GameState {
   };
 }
 
-export function startNewHand(state: GameState): GameState {
-  let newState = rotateButton(state);
+export function startNewHand(game: GameState): GameState {
+  const DEBUG_STARTING_STACK = 10000; // $100.00 — remove later for real stacks
+
+  let newGame: GameState = {
+    ...game,
+    hand_number: (game.hand_number || 0) + 1,
+    pot: 0,
+    current_wager: 0,
+    min_raise: 0,
+    last_aggressor_seat: null,
+    board: { top: [null, null, null, null, null, null], shredder: [null, null, null, null, null, null] },
+    deck: shuffleDeck(createStandardDeck()),
+    deck_index: 0,
+    status: "preflop_betting" as GameStatus,
+    last_action: `Starting hand #${(game.hand_number || 0) + 1}`,
+  };
 
   // Reset players
-  newState.players = newState.players.map(player => ({
-    ...player,
+  newGame.players = newGame.players.map((p) => ({
+    ...p,
+    stack: DEBUG_STARTING_STACK,
+    contributed_this_hand: 0,
+    bet_this_street: 0,
     hole_cards: [],
     live_hole_cards: [],
     shredded_cards: [],
-    contributed_this_hand: 0,
-    bet_this_street: 0,
     discard_submitted: false,
-    status: player.stack > 0 ? 'active' : 'folded',
+    status: "active",
     current_pip_total: 0,
     final_pip_total: null,
     hand_result: null,
   }));
 
-  // Reset deck for new hand
-  const freshDeck = shuffleDeck(createStandardDeck());
+  newGame = postBlinds(newGame);
+  newGame = dealHoleCards(newGame);
 
-  newState = postBlinds(newState);
+  // === CRITICAL PREFLOP FIRST TO ACT ===
+  // After BB posts, action starts on the player to the left of the BB
+  const bbSeat = newGame.players.find(p => p.bet_this_street === newGame.blinds.big)?.seat ?? newGame.button_seat;
+  newGame.current_player_seat = getNextActiveSeat(newGame, bbSeat);
 
-  newState.hand_number = (newState.hand_number || 0) + 1;
-  newState.skip_discard_eligible = false;
-  newState.board = { top: [null, null, null, null, null, null], shredder: [null, null, null, null, null, null] };
-  newState.deck = freshDeck;
-  newState.deck_index = 0;
-
-  return newState;
+  return newGame;
 }
 /**
  * Pure orchestrator: Advance the game to the next logical phase.
@@ -694,33 +712,39 @@ export function startNewHand(state: GameState): GameState {
 export function advanceToNextPhase(game: GameState): GameState {
   let newGame = { ...game };
 
-  // Reset per-street betting
-  newGame.players = newGame.players.map(p => ({ ...p, bet_this_street: 0 }));
+  // IMPORTANT: Do NOT add bets to pot again — processBet already did that
+  // Just reset this street's bets
+  newGame.players = newGame.players.map((p) => ({
+    ...p,
+    bet_this_street: 0,
+  }));
+
   newGame.current_wager = 0;
   newGame.last_aggressor_seat = null;
 
-  if (['preflop_betting', 'dealt_holes', 'waiting'].includes(newGame.status)) {
+  // Advance phase + set correct next player
+  if (game.status === "preflop_betting" || game.status === "waiting") {
     newGame = dealFlop(newGame);
-    newGame.current_player_seat = getFirstToAct(newGame, 'postflop');
-    newGame.status = 'flop_betting' as GameStatus;
-    newGame.last_action = 'Flop dealt + auto-shred';
-
-  } else if (newGame.status === 'flop_betting') {
+    newGame.status = "flop_betting" as GameStatus;
+    // Postflop first to act = player to the left of the button
+    newGame.current_player_seat = getNextActiveSeat(newGame, newGame.button_seat);
+  } 
+  else if (game.status === "flop_betting") {
     newGame = dealTurn(newGame);
-    newGame.current_player_seat = getFirstToAct(newGame, 'postflop');
-    newGame.status = 'turn_betting' as GameStatus;
-    newGame.last_action = 'Turn dealt + auto-shred';
-
-  } else if (newGame.status === 'turn_betting') {
+    newGame.status = "turn_betting" as GameStatus;
+    newGame.current_player_seat = getNextActiveSeat(newGame, newGame.button_seat);
+  } 
+  else if (game.status === "turn_betting") {
     newGame = dealRiver(newGame);
-    newGame.current_player_seat = getFirstToAct(newGame, 'postflop');
-    newGame.status = 'river_betting' as GameStatus;
-    newGame.last_action = 'River dealt + auto-shred';
-
-  } else if (newGame.status === 'river_betting') {
-    newGame.status = 'showdown' as GameStatus;
+    newGame.status = "river_betting" as GameStatus;
+    newGame.current_player_seat = getNextActiveSeat(newGame, newGame.button_seat);
+  } 
+  else if (game.status === "river_betting") {
+    newGame.status = "showdown" as GameStatus;
     newGame.current_player_seat = null;
-    newGame.last_action = 'Advanced to showdown';
+  } 
+  else if (game.status === "showdown") {
+    return awardPot(newGame);
   }
 
   newGame.updated_at = now();
