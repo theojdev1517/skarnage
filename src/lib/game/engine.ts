@@ -667,7 +667,7 @@ export function postBlinds(state: GameState): GameState {
     current_wager: workingState.blinds.big,
     min_raise: workingState.blinds.big * 2,
     current_player_seat: firstToAct,
-    last_aggressor_seat: bbSeat,
+    last_aggressor_seat: null,
     status: 'preflop_betting' as GameStatus,
     last_action: 'blinds_posted',
     action_history: [
