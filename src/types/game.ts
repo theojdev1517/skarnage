@@ -60,4 +60,5 @@ export interface GameState {
   last_action: string;
   deck: Card[];
   deck_index: number;
+  hasBigBlindActedThisStreet?: boolean;   // add this
 }

@@ -19,8 +19,9 @@ export default function GamePage() {
     }
   };
 
-  const handleAction = async (betAction: "fold" | "check" | "call" | "raise") => {
+  const handleAction = async (betAction: "fold" | "check" | "call" | "raise", amount: number = 0) => {
     if (!game) return alert("No game");
+
     const currentPlayer = game.players?.find(p => p.seat === game.current_player_seat);
     if (!currentPlayer) return alert("No current player to act");
 
@@ -32,7 +33,7 @@ export default function GamePage() {
           action: 'bet',
           seat: currentPlayer.seat,
           betAction,
-          amount: betAction === 'raise' ? 200 : 0,
+          amount,
         }),
       });
 
@@ -40,6 +41,7 @@ export default function GamePage() {
       if (!res.ok) {
         alert(data.error || 'Action failed');
       }
+      // Supabase realtime will update the UI
     } catch (e) {
       console.error(e);
       alert('Failed to send action');
@@ -59,22 +61,6 @@ export default function GamePage() {
     } catch (e) {
       console.error(e);
       alert('Failed to start hand');
-    }
-  };
-
-  const handleAdvance = async () => {
-    if (!game) return;
-    try {
-      const res = await fetch(`/api/game/${gameId}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'advance' }),
-      });
-      const data = await res.json();
-      if (!res.ok) alert(data.error || 'Advance failed');
-    } catch (e) {
-      console.error(e);
-      alert('Failed to advance phase');
     }
   };
 
@@ -159,7 +145,7 @@ export default function GamePage() {
 
         {/* Action Bar */}
         <div className="bg-zinc-900 p-6 rounded-xl">
-          <p className="text-center text-zinc-400 mb-4">
+          <p className="text-center text-emerald-400 mb-4 font-medium">
             {currentPlayer 
               ? `Seat ${currentPlayer.seat} (${currentPlayer.display_name}) to act` 
               : 'Waiting for players...'}
@@ -167,11 +153,30 @@ export default function GamePage() {
 
           {currentPlayer && (
             <div className="flex flex-wrap gap-3 justify-center">
-              <button onClick={() => handleAction('fold')} className="bg-red-600 hover:bg-red-700 px-8 py-3 rounded font-medium">Fold</button>
-              <button onClick={() => handleAction('check')} className="bg-zinc-600 hover:bg-zinc-500 px-8 py-3 rounded font-medium">Check</button>
-              <button onClick={() => handleAction('call')} className="bg-emerald-600 hover:bg-emerald-500 px-8 py-3 rounded font-medium">Call</button>
-              <button onClick={() => handleAction('raise')} className="bg-amber-600 hover:bg-amber-500 px-8 py-3 rounded font-medium">Raise</button>
-              <button onClick={handleAdvance} className="bg-purple-600 hover:bg-purple-500 px-6 py-3 rounded font-medium text-sm">Next Phase (Debug)</button>
+              <button 
+                onClick={() => handleAction('fold')} 
+                className="bg-red-600 hover:bg-red-700 px-8 py-3 rounded font-medium"
+              >
+                Fold
+              </button>
+              <button 
+                onClick={() => handleAction('check')} 
+                className="bg-zinc-600 hover:bg-zinc-500 px-8 py-3 rounded font-medium"
+              >
+                Check
+              </button>
+              <button 
+                onClick={() => handleAction('call')} 
+                className="bg-emerald-600 hover:bg-emerald-500 px-8 py-3 rounded font-medium"
+              >
+                Call
+              </button>
+              <button 
+                onClick={() => handleAction('raise', (game.current_wager || game.blinds.big) * 2)} 
+                className="bg-amber-600 hover:bg-amber-500 px-8 py-3 rounded font-medium"
+              >
+                Raise
+              </button>
             </div>
           )}
         </div>

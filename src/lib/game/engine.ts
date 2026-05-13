@@ -265,24 +265,36 @@ export function getNextPlayerSeat(game: GameState, currentSeat: number): number 
   return active[(idx + 1) % active.length].seat;
 }
 
+// src/lib/game/engine.ts  (update these functions)
+
 export function isBettingRoundComplete(game: GameState): boolean {
-  const active = game.players.filter((p) => p.status === "active" || p.status === "all_in");
-  if (active.length <= 1) return true;
+  const activePlayers = game.players.filter(p => 
+    p.status === 'active' || p.status === 'all_in'
+  );
 
-  const currentWager = game.current_wager || 0;
+  if (activePlayers.length <= 1) return true;
 
-  const everyoneMatchedOrAllIn = active.every((p) =>
+  const currentWager = game.current_wager ?? 0;
+  const everyoneMatched = activePlayers.every(p => 
     p.bet_this_street >= currentWager || p.stack === 0
   );
 
-  if (!everyoneMatchedOrAllIn) return false;
+  if (!everyoneMatched) return false;
 
-  // Action has closed back to the last aggressor
+  // === AGGRESSION ROUND ===
   if (game.last_aggressor_seat !== null) {
     return game.current_player_seat === game.last_aggressor_seat;
   }
 
-  return true;
+  // === PURE CHECK/CALL ROUND ===
+  if (game.status === "preflop_betting" || game.status === "waiting") {
+    // Preflop: only complete after BB has acted
+    return game.hasBigBlindActedThisStreet === true;
+  } else {
+    // Postflop: complete when back to first-to-act (left of button)
+    const firstToAct = getNextActiveSeat(game, game.button_seat || 0)!;
+    return game.current_player_seat === firstToAct;
+  }
 }
 
 export function processBet(
@@ -291,52 +303,47 @@ export function processBet(
   action: "fold" | "check" | "call" | "raise",
   amount: number = 0
 ): GameState {
-  const playerIndex = game.players.findIndex((p) => p.seat === seat);
+  const playerIndex = game.players.findIndex(p => p.seat === seat);
   if (playerIndex === -1) throw new Error("Player not found");
 
   const player = game.players[playerIndex];
+
   if (seat !== game.current_player_seat) {
-    throw new Error(`Not your turn! Current seat: ${game.current_player_seat}`);
+    throw new Error(`Not your turn! Current: ${game.current_player_seat}`);
   }
-  if (player.status !== "active") {
+  if (!["active", "all_in"].includes(player.status)) {
     throw new Error("Player cannot act");
   }
 
   const updatedPlayers = [...game.players];
-  let newWager = game.current_wager;
-  let newMinRaise = game.min_raise;
-  let newLastAggressor = game.last_aggressor_seat;
+  let newWager = game.current_wager ?? 0;
+  let newMinRaise = game.min_raise ?? 0;
+  let newAggressor = game.last_aggressor_seat;
   let lastActionText = "";
-  let potAddition = 0;
 
-  const toCall = game.current_wager - player.bet_this_street;
+  const toCall = Math.max(0, newWager - player.bet_this_street);
 
   if (action === "fold") {
     updatedPlayers[playerIndex] = { ...player, status: "folded" as const };
     lastActionText = `${player.display_name} folded`;
-  } 
-  else if (action === "check") {
+  } else if (action === "check") {
     if (toCall > 0) throw new Error("Cannot check — must call or raise");
     lastActionText = `${player.display_name} checked`;
-  } 
-  else if (action === "call") {
+  } else if (action === "call") {
     const callAmount = Math.min(toCall, player.stack);
-    potAddition = callAmount;
     updatedPlayers[playerIndex] = {
       ...player,
       bet_this_street: player.bet_this_street + callAmount,
       contributed_this_hand: player.contributed_this_hand + callAmount,
       stack: player.stack - callAmount,
     };
-    lastActionText = `${player.display_name} called $${callAmount}`;
-  } 
-  else if (action === "raise") {
-    const minRaiseAmount = game.min_raise || game.blinds.big * 2;
-    const raiseTo = Math.max(game.current_wager + minRaiseAmount, amount);
+    lastActionText = `${player.display_name} called`;
+  } else if (action === "raise") {
+    const minRaiseAmount = newMinRaise || (game.blinds?.big ?? 100) * 2;
+    const raiseTo = Math.max(newWager + minRaiseAmount, amount);
     const raiseAmount = raiseTo - player.bet_this_street;
     const actual = Math.min(raiseAmount, player.stack);
 
-    potAddition = actual;
     updatedPlayers[playerIndex] = {
       ...player,
       bet_this_street: player.bet_this_street + actual,
@@ -346,24 +353,38 @@ export function processBet(
 
     newWager = player.bet_this_street + actual;
     newMinRaise = actual;
-    newLastAggressor = seat;
-    lastActionText = `${player.display_name} raised to $${newWager}`;
+    newAggressor = seat;
+    lastActionText = `${player.display_name} raised`;
   }
 
-  const nextSeat = getNextActiveSeat(game, seat);
+  const newPot = updatedPlayers.reduce((sum, p) => sum + p.contributed_this_hand, 0);
 
-  return {
+  let result: GameState = {
     ...game,
     players: updatedPlayers,
-    pot: game.pot + potAddition,
+    pot: newPot,
     current_wager: newWager,
     min_raise: newMinRaise,
-    last_aggressor_seat: newLastAggressor,
-    current_player_seat: nextSeat,
-    updated_at: now(),
+    last_aggressor_seat: newAggressor,
+    current_player_seat: getNextActiveSeat(game, seat)!,
+    updated_at: Date.now(),
     last_action: lastActionText,
+    hasBigBlindActedThisStreet: 
+      (game.status === "preflop_betting" || game.status === "waiting") && 
+      seat === getBigBlindSeat(game) 
+        ? true 
+        : game.hasBigBlindActedThisStreet,
   };
+
+  // 🔥 AUTO ADVANCE
+  if (isBettingRoundComplete(result)) {
+    console.log(`🔄 Auto-advancing from ${game.phase} after ${action}`);
+    result = advanceToNextPhase(result);
+  }
+
+  return result;
 }
+
 
 // High Hand, Showdown, Award, Lifecycle
 export function evaluatePlayerHand(player: Player, topBoard: (Card | null)[]): HandEvaluation {
@@ -565,16 +586,17 @@ export function getActivePlayers(state: GameState): Player[] {
   return state.players.filter(isActive);
 }
 
-export function getNextActiveSeat(state: GameState, afterSeat: number): number | null {
-  const activePlayers = state.players
-    .filter((p) => p.status === "active" || p.status === "all_in")
+export function getNextActiveSeat(game: GameState, fromSeat: number): number | null {
+  const active = game.players
+    .filter(p => p.status === 'active' || p.status === 'all_in')
     .sort((a, b) => a.seat - b.seat);
 
-  if (activePlayers.length === 0) return null;
+  if (active.length === 0) return null;
 
-  const idx = activePlayers.findIndex((p) => p.seat === afterSeat);
-  if (idx === -1) return activePlayers[0].seat;
-  return activePlayers[(idx + 1) % activePlayers.length].seat;
+  const idx = active.findIndex(p => p.seat === fromSeat);
+  if (idx === -1) return active[0]?.seat ?? null;
+
+  return active[(idx + 1) % active.length].seat;
 }
 
 export function rotateButton(state: GameState): GameState {
@@ -712,21 +734,25 @@ export function startNewHand(game: GameState): GameState {
 export function advanceToNextPhase(game: GameState): GameState {
   let newGame = { ...game };
 
-  // IMPORTANT: Do NOT add bets to pot again — processBet already did that
-  // Just reset this street's bets
+  // Reset this street's betting state for ALL players
+  newGame.hasBigBlindActedThisStreet = false;
   newGame.players = newGame.players.map((p) => ({
     ...p,
     bet_this_street: 0,
+    // Reactivate non-folded/non-dead players for the next street
+    status: (p.status === "folded" || p.status === "dead") 
+      ? p.status 
+      : "active" as const,
   }));
 
   newGame.current_wager = 0;
+  newGame.min_raise = 0;
   newGame.last_aggressor_seat = null;
 
-  // Advance phase + set correct next player
+  // Advance phase + deal cards + set correct next player
   if (game.status === "preflop_betting" || game.status === "waiting") {
     newGame = dealFlop(newGame);
     newGame.status = "flop_betting" as GameStatus;
-    // Postflop first to act = player to the left of the button
     newGame.current_player_seat = getNextActiveSeat(newGame, newGame.button_seat);
   } 
   else if (game.status === "flop_betting") {
@@ -757,4 +783,10 @@ export function isHandLive(player: Player): boolean {
 
 export function isDeadHand(player: Player): boolean {
   return player.live_hole_cards.length === 0 || player.status === "dead";
+}
+
+function getBigBlindSeat(game: GameState): number {
+  const button = game.button_seat || 0;
+  const sb = getNextActiveSeat(game, button);
+  return getNextActiveSeat(game, sb!)!;
 }
