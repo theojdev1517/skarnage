@@ -1,6 +1,22 @@
-import type { GameState, GameStatus } from '@/types/game';
+import type { GameState, GameStatus, Player } from '@/types/game';
 
-/** Strip secrets from game state before rendering (hole cards, deck). */
+export {
+  getWagerBounds,
+  getToCall,
+  getPotLimitMaxWager,
+  getMinRaiseIncrement,
+} from '@/lib/game/bettingLimits';
+
+function stripPlayerSecrets(player: Player): Player {
+  return {
+    ...player,
+    hole_cards: [],
+    live_hole_cards: [],
+    shredded_cards: [],
+  };
+}
+
+/** Strip secrets from game state before sending to clients (hole cards, deck). */
 export function sanitizeGameStateForUser(
   game: GameState,
   userId: string | null
@@ -10,13 +26,7 @@ export function sanitizeGameStateForUser(
     deck: [],
     deck_index: 0,
     players: game.players.map((p) =>
-      userId && p.user_id === userId
-        ? p
-        : {
-            ...p,
-            hole_cards: [],
-            live_hole_cards: [],
-          }
+      userId && p.user_id === userId ? p : stripPlayerSecrets(p)
     ),
   };
 }

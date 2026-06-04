@@ -25,6 +25,30 @@ function requireHost(game: GameState, userId: string) {
   return null;
 }
 
+export async function GET(
+  _request: NextRequest,
+  { params }: { params: Promise<{ gameId: string }> }
+) {
+  try {
+    const { gameId } = await params;
+    const supabase = await createServerClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    const loaded = await loadGame(supabase, gameId);
+    if ('error' in loaded) return loaded.error;
+
+    return NextResponse.json({
+      game: sanitizeGameStateForUser(loaded.game, user?.id ?? null),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Internal server error';
+    console.error('API GET Error:', error);
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
+}
+
 export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ gameId: string }> }

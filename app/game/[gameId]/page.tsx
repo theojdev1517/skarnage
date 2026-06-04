@@ -7,6 +7,7 @@ import { useAuth } from '@/hooks/useAuth';
 import { isBettingPhase } from '@/lib/game/clientView';
 import { evaluateHighHand } from '@/lib/game/evaluator';
 import { CardGrid, CardRow } from '@/components/game/PlayingCard';
+import { BettingControls } from '@/components/game/BettingControls';
 import { JoinSeatModal } from '@/components/game/JoinSeatModal';
 import { SeatHostMenu } from '@/components/game/SeatHostMenu';
 import { formatStack } from '@/lib/formatStack';
@@ -15,7 +16,8 @@ import type { Card, Player } from '@/types/game';
 export default function GamePage() {
   const { gameId } = useParams<{ gameId: string }>();
   const { userId, loading: authLoading } = useAuth();
-  const { game, loading: gameLoading } = useGameState(gameId || '', userId);
+  const { game, loading: gameLoading, refresh } = useGameState(gameId || '', userId);
+  const [actionBusy, setActionBusy] = useState(false);
 
   const loading = authLoading || gameLoading;
 
@@ -92,6 +94,7 @@ export default function GamePage() {
   ) => {
     if (!game || !myPlayer) return alert('Take a seat first');
     if (!isMyTurn) return alert('Not your turn');
+    setActionBusy(true);
     try {
       await postGameAction({
         action: 'bet',
@@ -99,8 +102,15 @@ export default function GamePage() {
         betAction,
         amount,
       });
+      await refresh();
     } catch (e) {
-      alert(e instanceof Error ? e.message : 'Action failed');
+      const message = e instanceof Error ? e.message : 'Action failed';
+      if (betAction === 'bet' || betAction === 'raise') {
+        throw new Error(message);
+      }
+      alert(message);
+    } finally {
+      setActionBusy(false);
     }
   };
 
@@ -118,9 +128,6 @@ export default function GamePage() {
       ? Math.max(0, (game.current_wager ?? 0) - myPlayer.bet_this_street)
       : 0;
   const facingBet = toCall > 0;
-  const defaultBetAmount = facingBet
-    ? Math.max((game.current_wager ?? 0) + (game.min_raise || game.blinds.big * 2), game.blinds.big * 2)
-    : game.blinds.big * 2;
 
   return (
     <div className="min-h-screen max-h-screen overflow-hidden bg-[#0a1f0a] text-white flex flex-col">
@@ -324,51 +331,14 @@ export default function GamePage() {
             {myPlayer && !isMyTurn && isBettingPhase(game.status) && (
               <p className="text-center text-zinc-500 text-xs">Your turn soon</p>
             )}
-            {isMyTurn && (
-              <div className="grid grid-cols-3 gap-1">
-                <button
-                  type="button"
-                  onClick={() => handleAction('fold')}
-                  className="py-2 rounded text-xs font-medium bg-red-700 hover:bg-red-600"
-                >
-                  Fold
-                </button>
-                {facingBet ? (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => handleAction('call')}
-                      className="py-2 rounded text-xs font-medium bg-emerald-700 hover:bg-emerald-600"
-                    >
-                      Call
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleAction('raise', defaultBetAmount)}
-                      className="py-2 rounded text-xs font-medium bg-amber-600 hover:bg-amber-500"
-                    >
-                      Raise
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => handleAction('check')}
-                      className="py-2 rounded text-xs font-medium bg-emerald-700 hover:bg-emerald-600"
-                    >
-                      Check
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleAction('bet', defaultBetAmount)}
-                      className="py-2 rounded text-xs font-medium bg-amber-600 hover:bg-amber-500"
-                    >
-                      Bet
-                    </button>
-                  </>
-                )}
-              </div>
+            {isMyTurn && myPlayer && (
+              <BettingControls
+                game={game}
+                player={myPlayer}
+                facingBet={facingBet}
+                busy={actionBusy}
+                onAction={handleAction}
+              />
             )}
           </div>
         </div>

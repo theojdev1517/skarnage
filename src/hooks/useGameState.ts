@@ -1,21 +1,25 @@
 'use client';
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { createClient } from '@/lib/supabase';
-import { sanitizeGameStateForUser } from '@/lib/game/clientView';
 import type { GameState } from '@/types/game';
 
-export function useGameState(gameId: string, userId: string | null) {
-  const [rawGame, setRawGame] = useState<GameState | null>(null);
+export function useGameState(gameId: string, _userId: string | null) {
+  const [game, setGame] = useState<GameState | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const supabase = useMemo(() => createClient(), []);
 
-  const game = useMemo(
-    () => (rawGame ? sanitizeGameStateForUser(rawGame, userId) : null),
-    [rawGame, userId]
-  );
+  const fetchGame = useCallback(async () => {
+    if (!gameId) return;
+    const res = await fetch(`/api/game/${gameId}`, { credentials: 'include' });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to load game');
+    }
+    setGame(data.game as GameState);
+  }, [gameId]);
 
   useEffect(() => {
     if (!gameId) {
@@ -25,28 +29,21 @@ export function useGameState(gameId: string, userId: string | null) {
 
     let subscribed = true;
 
-    const applyState = (state: GameState) => {
-      if (subscribed) setRawGame(state);
-    };
-
-    const fetchInitial = async () => {
+    const load = async () => {
       setLoading(true);
-      const { data, error: fetchError } = await supabase
-        .from('games')
-        .select('game_state')
-        .eq('id', gameId)
-        .single();
-
-      if (fetchError) {
-        console.error('Fetch error:', fetchError);
-        setError(fetchError.message);
-      } else if (data?.game_state) {
-        applyState(data.game_state as GameState);
+      setError(null);
+      try {
+        await fetchGame();
+      } catch (e) {
+        if (subscribed) {
+          setError(e instanceof Error ? e.message : 'Failed to load game');
+        }
+      } finally {
+        if (subscribed) setLoading(false);
       }
-      setLoading(false);
     };
 
-    fetchInitial();
+    load();
 
     const channel = supabase
       .channel(`game:${gameId}`)
@@ -58,11 +55,8 @@ export function useGameState(gameId: string, userId: string | null) {
           table: 'games',
           filter: `id=eq.${gameId}`,
         },
-        (payload) => {
-          const row = payload.new as { game_state?: GameState } | undefined;
-          if (row?.game_state) {
-            applyState(row.game_state);
-          }
+        () => {
+          fetchGame().catch(() => {});
         }
       )
       .subscribe();
@@ -71,7 +65,7 @@ export function useGameState(gameId: string, userId: string | null) {
       subscribed = false;
       supabase.removeChannel(channel);
     };
-  }, [gameId, supabase]);
+  }, [gameId, supabase, fetchGame]);
 
-  return { game, loading, error };
+  return { game, loading, error, refresh: fetchGame };
 }

@@ -1,7 +1,8 @@
 // src/lib/game/engine.ts
 import type { GameState, Player, Card, GameStatus, ShowdownSummary } from "@/types/game";
 import type { HandEvaluation } from "./evaluator";
-import { evaluateHighHand, parseCardRank } from "./evaluator";   // add parseCardRank
+import { evaluateHighHand, parseCardRank } from "./evaluator";
+import { validateWagerTo } from "./bettingLimits";
 
 export function now(): string {
   return new Date().toISOString();
@@ -354,12 +355,13 @@ export function processBet(
   }
 
   const updatedPlayers = [...game.players];
-  let newWager = game.current_wager ?? 0;
+  const oldWager = game.current_wager ?? 0;
+  let newWager = oldWager;
   let newMinRaise = game.min_raise ?? 0;
   let newAggressor = game.last_aggressor_seat;
   let lastActionText = "";
 
-  const toCall = Math.max(0, newWager - player.bet_this_street);
+  const toCall = Math.max(0, oldWager - player.bet_this_street);
 
   if (action === "fold") {
     updatedPlayers[playerIndex] = { ...player, status: "folded" as const };
@@ -379,8 +381,7 @@ export function processBet(
     lastActionText = `${player.display_name} called ${formatCents(callAmount)}`;
   } else if (action === "bet") {
     if (toCall > 0) throw new Error("Cannot bet — call or raise");
-    const minBet = game.blinds?.big ?? 50;
-    const betTo = Math.max(minBet, amount);
+    const betTo = validateWagerTo(game, seat, "bet", amount);
     const betAmount = betTo - player.bet_this_street;
     const actual = Math.min(betAmount, player.stack);
 
@@ -392,15 +393,14 @@ export function processBet(
     };
 
     newWager = player.bet_this_street + actual;
-    newMinRaise = actual;
+    newMinRaise = newWager - oldWager;
     newAggressor = seat;
     lastActionText = `${player.display_name} bet ${formatCents(actual)}`;
   } else if (action === "raise") {
     if (toCall <= 0 && newWager <= 0) {
       throw new Error("Cannot raise — bet to open the action");
     }
-    const minRaiseAmount = newMinRaise || (game.blinds?.big ?? 100) * 2;
-    const raiseTo = Math.max(newWager + minRaiseAmount, amount);
+    const raiseTo = validateWagerTo(game, seat, "raise", amount);
     const raiseAmount = raiseTo - player.bet_this_street;
     const actual = Math.min(raiseAmount, player.stack);
 
@@ -412,7 +412,7 @@ export function processBet(
     };
 
     newWager = player.bet_this_street + actual;
-    newMinRaise = actual;
+    newMinRaise = newWager - oldWager;
     newAggressor = seat;
     lastActionText = `${player.display_name} raised to ${formatCents(newWager)}`;
   }
@@ -770,7 +770,7 @@ export function postBlinds(state: GameState): GameState {
     ...workingState,
     pot: newPot,
     current_wager: workingState.blinds.big,
-    min_raise: workingState.blinds.big * 2,
+    min_raise: workingState.blinds.big,
     current_player_seat: firstToAct,
     last_aggressor_seat: null,
     status: 'preflop_betting' as GameStatus,
