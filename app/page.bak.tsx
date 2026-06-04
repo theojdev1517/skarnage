@@ -18,9 +18,9 @@ export default function SkarneyHandStepper() {
   };
 
   const startNewHandFull = () => {
-    let g = engine.createNewGame("test-host", "Theo");
-    g = engine.joinSeat(g, "p2", 2, "Alice");
-    g = engine.joinSeat(g, "p3", 3, "Bob");
+    let g = engine.createNewGame("test-game", "test-host", "Theo", 10000);
+    g = engine.joinSeat(g, "p2", 2, "Alice", 10000);
+    g = engine.joinSeat(g, "p3", 3, "Bob", 10000);
 
     g = engine.startNewHand(g);
     g = engine.dealHoleCards(g);

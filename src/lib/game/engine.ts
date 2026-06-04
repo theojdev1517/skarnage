@@ -1,5 +1,5 @@
 // src/lib/game/engine.ts
-import type { GameState, Player, Card, GameStatus } from "@/types/game";
+import type { GameState, Player, Card, GameStatus, ShowdownSummary } from "@/types/game";
 import type { HandEvaluation } from "./evaluator";
 import { evaluateHighHand, parseCardRank } from "./evaluator";   // add parseCardRank
 
@@ -8,15 +8,46 @@ export function now(): string {
 }
 
 // Game Creation & Joining
-export function createNewGame(hostId: string, hostName: string): GameState {
-  const gameId = `game_${Date.now()}`;
-  const fullDeck = createStandardDeck();
+
+/** Empty table — no players; first seated player becomes host (set in join flow). */
+export function createEmptyTable(gameId: string): GameState {
+  return {
+    game_id: gameId,
+    host_id: "",
+    hand_number: 0,
+    status: "waiting",
+    updated_at: now(),
+    pot: 0,
+    current_wager: 0,
+    min_raise: 0,
+    blinds: { small: 25, big: 50 },
+    board: { top: [null, null, null, null, null, null], shredder: [null, null, null, null, null, null] },
+    players: [],
+    current_player_seat: null,
+    button_seat: 1,
+    last_aggressor_seat: null,
+    skip_discard_eligible: false,
+    side_pots: [],
+    action_history: [],
+    last_action: "Table open — take a seat to play",
+    deck: [],
+    deck_index: 0,
+  };
+}
+
+export function createNewGame(
+  gameId: string,
+  hostId: string,
+  hostName: string,
+  startingStackCents: number
+): GameState {
+  if (startingStackCents < 0) throw new Error("Starting stack cannot be negative");
 
   const hostPlayer: Player = {
     user_id: hostId,
     seat: 1,
     display_name: hostName,
-    stack: 10000,
+    stack: startingStackCents,
     contributed_this_hand: 0,
     bet_this_street: 0,
     hole_cards: [],
@@ -47,20 +78,27 @@ export function createNewGame(hostId: string, hostName: string): GameState {
     skip_discard_eligible: false,
     side_pots: [],
     action_history: [],
-    last_action: "Game created",
-    deck: fullDeck,
+    last_action: `${hostName} created the table (seat 1, ${formatChips(startingStackCents)} chips)`,
+    deck: [],
     deck_index: 0,
   };
 }
 
-export function joinSeat(game: GameState, userId: string, seat: number, displayName: string): GameState {
+export function joinSeat(
+  game: GameState,
+  userId: string,
+  seat: number,
+  displayName: string,
+  startingStackCents: number
+): GameState {
+  if (startingStackCents < 0) throw new Error("Starting stack cannot be negative");
   if (game.players.some(p => p.seat === seat)) throw new Error("Seat already taken");
 
   const newPlayer: Player = {
     user_id: userId,
     seat,
     display_name: displayName,
-    stack: 10000,
+    stack: startingStackCents,
     contributed_this_hand: 0,
     bet_this_street: 0,
     hole_cards: [],
@@ -201,7 +239,7 @@ export function dealFlop(game: GameState): GameState {
   newGame = shredCards(newGame);
   newGame.last_action = "Flop dealt + auto-shred";
 
-  newGame.last_action += ` | Pot: $${(newGame.pot / 100).toFixed(2)}`;
+  newGame.last_action += ` | Pot: ${formatChips(newGame.pot)}`;
 
   return newGame;
 }
@@ -300,7 +338,7 @@ export function isBettingRoundComplete(game: GameState): boolean {
 export function processBet(
   game: GameState,
   seat: number,
-  action: "fold" | "check" | "call" | "raise",
+  action: "fold" | "check" | "call" | "bet" | "raise",
   amount: number = 0
 ): GameState {
   const playerIndex = game.players.findIndex(p => p.seat === seat);
@@ -330,6 +368,7 @@ export function processBet(
     if (toCall > 0) throw new Error("Cannot check — must call or raise");
     lastActionText = `${player.display_name} checked`;
   } else if (action === "call") {
+    if (toCall <= 0) throw new Error("Nothing to call — check or bet");
     const callAmount = Math.min(toCall, player.stack);
     updatedPlayers[playerIndex] = {
       ...player,
@@ -337,8 +376,29 @@ export function processBet(
       contributed_this_hand: player.contributed_this_hand + callAmount,
       stack: player.stack - callAmount,
     };
-    lastActionText = `${player.display_name} called`;
+    lastActionText = `${player.display_name} called ${formatCents(callAmount)}`;
+  } else if (action === "bet") {
+    if (toCall > 0) throw new Error("Cannot bet — call or raise");
+    const minBet = game.blinds?.big ?? 50;
+    const betTo = Math.max(minBet, amount);
+    const betAmount = betTo - player.bet_this_street;
+    const actual = Math.min(betAmount, player.stack);
+
+    updatedPlayers[playerIndex] = {
+      ...player,
+      bet_this_street: player.bet_this_street + actual,
+      contributed_this_hand: player.contributed_this_hand + actual,
+      stack: player.stack - actual,
+    };
+
+    newWager = player.bet_this_street + actual;
+    newMinRaise = actual;
+    newAggressor = seat;
+    lastActionText = `${player.display_name} bet ${formatCents(actual)}`;
   } else if (action === "raise") {
+    if (toCall <= 0 && newWager <= 0) {
+      throw new Error("Cannot raise — bet to open the action");
+    }
     const minRaiseAmount = newMinRaise || (game.blinds?.big ?? 100) * 2;
     const raiseTo = Math.max(newWager + minRaiseAmount, amount);
     const raiseAmount = raiseTo - player.bet_this_street;
@@ -354,7 +414,7 @@ export function processBet(
     newWager = player.bet_this_street + actual;
     newMinRaise = actual;
     newAggressor = seat;
-    lastActionText = `${player.display_name} raised`;
+    lastActionText = `${player.display_name} raised to ${formatCents(newWager)}`;
   }
 
   const newPot = updatedPlayers.reduce((sum, p) => sum + p.contributed_this_hand, 0);
@@ -367,7 +427,7 @@ export function processBet(
     min_raise: newMinRaise,
     last_aggressor_seat: newAggressor,
     current_player_seat: getNextActiveSeat(game, seat)!,
-    updated_at: Date.now(),
+    updated_at: now(),
     last_action: lastActionText,
     hasBigBlindActedThisStreet: 
       (game.status === "preflop_betting" || game.status === "waiting") && 
@@ -376,10 +436,11 @@ export function processBet(
         : game.hasBigBlindActedThisStreet,
   };
 
-  // 🔥 AUTO ADVANCE
   if (isBettingRoundComplete(result)) {
-    console.log(`🔄 Auto-advancing from ${game.phase} after ${action}`);
     result = advanceToNextPhase(result);
+    if (result.status === 'showdown') {
+      result = awardPot(result);
+    }
   }
 
   return result;
@@ -444,25 +505,54 @@ export function determineShowdown(game: GameState): ShowdownResult {
   };
 }
 
+function formatChips(cents: number): string {
+  return (cents / 100).toFixed(2);
+}
+
+const formatCents = formatChips;
+
 export function awardPot(game: GameState): GameState {
   const result = determineShowdown(game);
   const updatedPlayers = [...game.players];
 
-  const highWinnersSet = new Set(result.highWinners.map(p => p.user_id));
-  const lowWinnersSet = new Set(result.lowWinners.map(p => p.user_id));
+  const highWinnersSet = new Set(result.highWinners.map((p) => p.user_id));
+  const lowWinnersSet = new Set(result.lowWinners.map((p) => p.user_id));
+  const highPerWinner =
+    result.highWinners.length > 0
+      ? Math.floor(result.highPotShare / result.highWinners.length)
+      : 0;
+  const lowPerWinner =
+    result.lowWinners.length > 0
+      ? Math.floor(result.lowPotShare / result.lowWinners.length)
+      : 0;
+
+  const showdown_summary: ShowdownSummary = {
+    high_winners: result.highWinners.map((p) => ({
+      seat: p.seat,
+      display_name: p.display_name,
+      amount_cents: highPerWinner,
+      hand_description: evaluatePlayerHand(p, game.board.top).description,
+    })),
+    low_winners: result.lowWinners.map((p) => ({
+      seat: p.seat,
+      display_name: p.display_name,
+      amount_cents: lowPerWinner,
+      pips: p.current_pip_total,
+    })),
+  };
 
   for (let i = 0; i < updatedPlayers.length; i++) {
     const p = updatedPlayers[i];
     let winnings = 0;
-    if (highWinnersSet.has(p.user_id)) winnings += Math.floor(result.highPotShare / result.highWinners.length);
-    if (lowWinnersSet.has(p.user_id)) winnings += Math.floor(result.lowPotShare / result.lowWinners.length);
+    if (highWinnersSet.has(p.user_id)) winnings += highPerWinner;
+    if (lowWinnersSet.has(p.user_id)) winnings += lowPerWinner;
 
     if (winnings > 0) {
       updatedPlayers[i] = {
         ...p,
         stack: p.stack + winnings,
         hand_result: {
-          high: result.highEvaluation,
+          high: evaluatePlayerHand(p, game.board.top),
           lowPips: p.current_pip_total,
           winnings,
         },
@@ -470,13 +560,28 @@ export function awardPot(game: GameState): GameState {
     }
   }
 
+  const highNames = showdown_summary.high_winners
+    .map((w) => `${w.display_name} (${w.hand_description}, ${formatCents(w.amount_cents)})`)
+    .join('; ');
+  const lowNames = showdown_summary.low_winners
+    .map((w) => `${w.display_name} (${w.pips} pips, ${formatCents(w.amount_cents)})`)
+    .join('; ');
+
+  const last_action = [
+    highNames ? `High: ${highNames}` : null,
+    lowNames ? `Low: ${lowNames}` : null,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+
   return {
     ...game,
     players: updatedPlayers,
     pot: 0,
     status: "finished" as GameStatus,
     updated_at: now(),
-    last_action: `Hand complete`,
+    last_action: last_action || 'Hand complete (no eligible winners)',
+    showdown_summary,
   };
 }
 
@@ -684,10 +789,10 @@ export function postBlinds(state: GameState): GameState {
 }
 
 export function startNewHand(game: GameState): GameState {
-  const DEBUG_STARTING_STACK = 10000; // $100.00 — remove later for real stacks
+  let newGame = rotateButton(game);
 
-  let newGame: GameState = {
-    ...game,
+  newGame = {
+    ...newGame,
     hand_number: (game.hand_number || 0) + 1,
     pot: 0,
     current_wager: 0,
@@ -698,19 +803,19 @@ export function startNewHand(game: GameState): GameState {
     deck_index: 0,
     status: "preflop_betting" as GameStatus,
     last_action: `Starting hand #${(game.hand_number || 0) + 1}`,
+    showdown_summary: null,
+    hasBigBlindActedThisStreet: false,
   };
 
-  // Reset players
   newGame.players = newGame.players.map((p) => ({
     ...p,
-    stack: DEBUG_STARTING_STACK,
     contributed_this_hand: 0,
     bet_this_street: 0,
     hole_cards: [],
     live_hole_cards: [],
     shredded_cards: [],
     discard_submitted: false,
-    status: "active",
+    status: "active" as const,
     current_pip_total: 0,
     final_pip_total: null,
     hand_result: null,
@@ -719,12 +824,98 @@ export function startNewHand(game: GameState): GameState {
   newGame = postBlinds(newGame);
   newGame = dealHoleCards(newGame);
 
-  // === CRITICAL PREFLOP FIRST TO ACT ===
-  // After BB posts, action starts on the player to the left of the BB
-  const bbSeat = newGame.players.find(p => p.bet_this_street === newGame.blinds.big)?.seat ?? newGame.button_seat;
+  const bbSeat =
+    newGame.players.find((p) => p.bet_this_street === newGame.blinds.big)?.seat ??
+    newGame.button_seat;
   newGame.current_player_seat = getNextActiveSeat(newGame, bbSeat);
 
   return newGame;
+}
+
+function hostUpdateStack(
+  game: GameState,
+  seat: number,
+  newStack: number,
+  lastAction: string
+): GameState {
+  if (newStack < 0) throw new Error("Stack cannot be negative");
+  const idx = game.players.findIndex((p) => p.seat === seat);
+  if (idx === -1) throw new Error("Player not found in seat");
+
+  const updated = [...game.players];
+  updated[idx] = { ...updated[idx], stack: newStack };
+
+  return {
+    ...game,
+    players: updated,
+    updated_at: now(),
+    last_action: lastAction,
+  };
+}
+
+/** Host: add chips to a player's stack. */
+export function hostAddToStack(
+  game: GameState,
+  seat: number,
+  amountCents: number
+): GameState {
+  if (amountCents <= 0) throw new Error("Amount must be positive");
+  const player = game.players.find((p) => p.seat === seat);
+  if (!player) throw new Error("Player not found in seat");
+  return hostUpdateStack(
+    game,
+    seat,
+    player.stack + amountCents,
+    `Host added ${formatCents(amountCents)} to ${player.display_name} (now ${formatCents(player.stack + amountCents)})`
+  );
+}
+
+/** Host: remove chips from a player's stack. */
+export function hostRemoveFromStack(
+  game: GameState,
+  seat: number,
+  amountCents: number
+): GameState {
+  if (amountCents <= 0) throw new Error("Amount must be positive");
+  const player = game.players.find((p) => p.seat === seat);
+  if (!player) throw new Error("Player not found in seat");
+  const newStack = Math.max(0, player.stack - amountCents);
+  return hostUpdateStack(
+    game,
+    seat,
+    newStack,
+    `Host removed ${formatCents(amountCents)} from ${player.display_name} (now ${formatCents(newStack)})`
+  );
+}
+
+/** Host: set a player's stack to an exact amount. */
+export function hostSetStack(
+  game: GameState,
+  seat: number,
+  targetCents: number
+): GameState {
+  if (targetCents < 0) throw new Error("Stack cannot be negative");
+  const player = game.players.find((p) => p.seat === seat);
+  if (!player) throw new Error("Player not found in seat");
+  return hostUpdateStack(
+    game,
+    seat,
+    targetCents,
+    `Host set ${player.display_name}'s stack to ${formatCents(targetCents)}`
+  );
+}
+
+/** Host: pass host controls to a seated player. */
+export function transferHost(game: GameState, seat: number): GameState {
+  const player = game.players.find((p) => p.seat === seat);
+  if (!player) throw new Error("No player in that seat");
+
+  return {
+    ...game,
+    host_id: player.user_id,
+    updated_at: now(),
+    last_action: `Host transferred to ${player.display_name} (seat ${seat})`,
+  };
 }
 /**
  * Pure orchestrator: Advance the game to the next logical phase.

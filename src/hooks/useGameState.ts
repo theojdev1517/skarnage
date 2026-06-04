@@ -1,16 +1,21 @@
-// src/hooks/useGameState.ts
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { createClient } from '@/lib/supabase';
+import { sanitizeGameStateForUser } from '@/lib/game/clientView';
 import type { GameState } from '@/types/game';
 
-export function useGameState(gameId: string) {
-  const [game, setGame] = useState<GameState | null>(null);
+export function useGameState(gameId: string, userId: string | null) {
+  const [rawGame, setRawGame] = useState<GameState | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const supabase = createClient();
+  const supabase = useMemo(() => createClient(), []);
+
+  const game = useMemo(
+    () => (rawGame ? sanitizeGameStateForUser(rawGame, userId) : null),
+    [rawGame, userId]
+  );
 
   useEffect(() => {
     if (!gameId) {
@@ -20,26 +25,29 @@ export function useGameState(gameId: string) {
 
     let subscribed = true;
 
+    const applyState = (state: GameState) => {
+      if (subscribed) setRawGame(state);
+    };
+
     const fetchInitial = async () => {
       setLoading(true);
-      const { data, error } = await supabase
+      const { data, error: fetchError } = await supabase
         .from('games')
         .select('game_state')
         .eq('id', gameId)
         .single();
 
-      if (error) {
-        console.error('Fetch error:', error);
-        setError(error.message);
-      } else if (data?.game_state && subscribed) {
-        setGame(data.game_state as GameState);
+      if (fetchError) {
+        console.error('Fetch error:', fetchError);
+        setError(fetchError.message);
+      } else if (data?.game_state) {
+        applyState(data.game_state as GameState);
       }
       setLoading(false);
     };
 
     fetchInitial();
 
-    // Realtime subscription
     const channel = supabase
       .channel(`game:${gameId}`)
       .on(
@@ -51,15 +59,13 @@ export function useGameState(gameId: string) {
           filter: `id=eq.${gameId}`,
         },
         (payload) => {
-          console.log('🔄 Realtime update received:', payload.eventType);
-          if (payload.new?.game_state) {
-            setGame(payload.new.game_state as GameState);
+          const row = payload.new as { game_state?: GameState } | undefined;
+          if (row?.game_state) {
+            applyState(row.game_state);
           }
         }
       )
-      .subscribe((status, err) => {
-        console.log('📡 Subscription status:', status, err);
-      });
+      .subscribe();
 
     return () => {
       subscribed = false;

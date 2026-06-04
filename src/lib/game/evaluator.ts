@@ -16,6 +16,117 @@ export interface HandEvaluation {
 const RANK_ORDER = "23456789TJQKA";
 const RANK_VALUE = new Map(RANK_ORDER.split('').map((r, i) => [r, i + 2]));
 
+const RANK_LABEL: Record<string, string> = {
+  A: "Ace",
+  K: "King",
+  Q: "Queen",
+  J: "Jack",
+  T: "Ten",
+  "9": "Nine",
+  "8": "Eight",
+  "7": "Seven",
+  "6": "Six",
+  "5": "Five",
+  "4": "Four",
+  "3": "Three",
+  "2": "Deuce",
+};
+
+const RANK_LABEL_PLURAL: Record<string, string> = {
+  A: "Aces",
+  K: "Kings",
+  Q: "Queens",
+  J: "Jacks",
+  T: "Tens",
+  "9": "Nines",
+  "8": "Eights",
+  "7": "Sevens",
+  "6": "Sixes",
+  "5": "Fives",
+  "4": "Fours",
+  "3": "Threes",
+  "2": "Deuces",
+};
+
+function rankLabel(rank: string, plural = false): string {
+  return plural ? (RANK_LABEL_PLURAL[rank] ?? rank) : (RANK_LABEL[rank] ?? rank);
+}
+
+function ranksByCount(cards: Card[], count: number): string[] {
+  const freq = new Map<string, number>();
+  for (const card of cards) {
+    const r = parseCardRank(card);
+    freq.set(r, (freq.get(r) || 0) + 1);
+  }
+  return [...freq.entries()]
+    .filter(([, c]) => c === count)
+    .map(([r]) => r)
+    .sort((a, b) => RANK_VALUE.get(b)! - RANK_VALUE.get(a)!);
+}
+
+function describeFiveCardHand(cards: Card[], handRank: HandRank): string {
+  const sorted = sortCardsDescending(cards);
+  const kickers = ranksByCount(sorted, 1);
+
+  switch (handRank) {
+    case "royal_flush":
+      return "Royal Flush";
+    case "straight_flush": {
+      const high = parseCardRank(sorted[0]);
+      return high === "5" ? "Five-high Straight Flush" : `${rankLabel(high)}-high Straight Flush`;
+    }
+    case "four_kind": {
+      const quad = ranksByCount(sorted, 4)[0];
+      const kicker = kickers[0];
+      return kicker
+        ? `Four ${rankLabel(quad, true)}, ${rankLabel(kicker)} kicker`
+        : `Four ${rankLabel(quad, true)}`;
+    }
+    case "full_house": {
+      const trips = ranksByCount(sorted, 3)[0];
+      const pair = ranksByCount(sorted, 2)[0];
+      return `${rankLabel(trips, true)} full of ${rankLabel(pair, true)}`;
+    }
+    case "flush":
+      return `${rankLabel(parseCardRank(sorted[0]))}-high Flush`;
+    case "straight": {
+      const high = parseCardRank(sorted[0]);
+      return high === "5" ? "Five-high Straight" : `${rankLabel(high)}-high Straight`;
+    }
+    case "three_kind": {
+      const trips = ranksByCount(sorted, 3)[0];
+      if (kickers.length >= 2) {
+        return `Three ${rankLabel(trips, true)}, ${rankLabel(kickers[0])}-${rankLabel(kickers[1])} kickers`;
+      }
+      if (kickers.length === 1) {
+        return `Three ${rankLabel(trips, true)}, ${rankLabel(kickers[0])} kicker`;
+      }
+      return `Three ${rankLabel(trips, true)}`;
+    }
+    case "two_pair": {
+      const pairs = ranksByCount(sorted, 2);
+      const highPair = pairs[0];
+      const lowPair = pairs[1];
+      const kicker = kickers[0];
+      const base = `Two Pair, ${rankLabel(highPair, true)} and ${rankLabel(lowPair, true)}`;
+      return kicker ? `${base}, ${rankLabel(kicker)} kicker` : base;
+    }
+    case "pair": {
+      const pair = ranksByCount(sorted, 2)[0];
+      if (kickers.length >= 2) {
+        return `Pair of ${rankLabel(pair, true)}, ${rankLabel(kickers[0])}-${rankLabel(kickers[1])} kickers`;
+      }
+      if (kickers.length === 1) {
+        return `Pair of ${rankLabel(pair, true)}, ${rankLabel(kickers[0])} kicker`;
+      }
+      return `Pair of ${rankLabel(pair, true)}`;
+    }
+    case "high_card":
+    default:
+      return `${rankLabel(parseCardRank(sorted[0]))} High`;
+  }
+}
+
 export function parseCardRank(card: Card): string {
   let rank = card.slice(0, -1);
   return rank === "10" ? "T" : rank;
@@ -138,12 +249,10 @@ export function evaluateHighHand(holeCards: Card[], communityCards: Card[]): Han
     }
   }
 
-  const desc = `${best.rank.replace(/_/g, ' ').toUpperCase()} ${parseCardRank(best.cards[0])}`;
-
   return {
     rank: best.rank,
     score: best.score,
     cards: best.cards,
-    description: desc
+    description: describeFiveCardHand(best.cards, best.rank),
   };
 }

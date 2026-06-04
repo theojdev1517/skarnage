@@ -39,6 +39,17 @@ export interface Board {
   shredder: (Card | null)[];
 }
 
+export interface ShowdownWinnerSummary {
+  seat: number;
+  display_name: string;
+  amount_cents: number;
+}
+
+export interface ShowdownSummary {
+  high_winners: (ShowdownWinnerSummary & { hand_description: string })[];
+  low_winners: (ShowdownWinnerSummary & { pips: number })[];
+}
+
 export interface GameState {
   game_id: string;
   host_id: string;
@@ -58,7 +69,8 @@ export interface GameState {
   side_pots: any[]; // TODO later
   action_history: any[];
   last_action: string;
+  showdown_summary?: ShowdownSummary | null;
   deck: Card[];
   deck_index: number;
-  hasBigBlindActedThisStreet?: boolean;   // add this
+  hasBigBlindActedThisStreet?: boolean;
 }
