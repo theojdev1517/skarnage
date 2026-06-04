@@ -1,63 +1,44 @@
 'use client';
 
 import { useState } from 'react';
-import { createClient } from '@/lib/supabase';
-import * as engine from '@/lib/game/engine';
 import { JoinSeatModal } from '@/components/game/JoinSeatModal';
+import { messageFromGameApi } from '@/lib/game/safeErrors';
 
 export default function Home() {
   const [loading, setLoading] = useState(false);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
-  const supabase = createClient();
 
   const createNewGame = async (displayName: string, stackCents: number) => {
     setLoading(true);
     setCreateError(null);
 
-    let {
-      data: { user },
-    } = await supabase.auth.getUser();
-    if (!user) {
-      const { data, error: signInError } = await supabase.auth.signInAnonymously();
-      if (signInError) {
-        console.error('Sign-in error:', signInError);
-        setCreateError('Could not sign in. Check Supabase anonymous auth is enabled.');
-        setLoading(false);
-        return;
-      }
-      user = data.user;
-    }
-
-    if (!user) {
-      setCreateError('Could not sign in. Check Supabase anonymous auth is enabled.');
-      setLoading(false);
-      return;
-    }
-
-    const gameId = crypto.randomUUID();
-    const name = displayName.trim() || 'Player';
-
     try {
-      const initialState = engine.createNewGame(gameId, user.id, name, stackCents);
-      const { error } = await supabase.from('games').insert({
-        id: gameId,
-        game_state: initialState,
-        host_id: user.id,
-        status: 'waiting',
+      const res = await fetch('/api/game', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          displayName,
+          startingStackCents: stackCents,
+        }),
       });
-
-      if (error) {
-        console.error('Insert error:', error);
-        setCreateError('Could not create table. Try again.');
+      let data: { error?: string; code?: string; gameId?: string } = {};
+      try {
+        data = await res.json();
+      } catch {
+        setCreateError('Server returned an invalid response. Try again.');
         setLoading(false);
         return;
       }
-
-      window.location.href = `/game/${gameId}`;
-    } catch (e) {
-      console.error('Create error:', e);
-      setCreateError(e instanceof Error ? e.message : 'Could not create table');
+      if (!res.ok) {
+        setCreateError(messageFromGameApi(data, 'Could not create the table.'));
+        setLoading(false);
+        return;
+      }
+      window.location.href = `/game/${data.gameId}`;
+    } catch {
+      setCreateError('Could not create the table. Check your connection and try again.');
       setLoading(false);
     }
   };

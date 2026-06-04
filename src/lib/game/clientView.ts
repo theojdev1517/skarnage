@@ -39,8 +39,3 @@ export function isBettingPhase(status: GameStatus): boolean {
     status === 'river_betting'
   );
 }
-
-export function formatCards(cards: string[]): string {
-  if (!cards.length) return '—';
-  return cards.join('  ');
-}

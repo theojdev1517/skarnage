@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { useGameState } from '@/hooks/useGameState';
 import { useAuth } from '@/hooks/useAuth';
@@ -10,14 +10,26 @@ import { CardGrid, CardRow } from '@/components/game/PlayingCard';
 import { BettingControls } from '@/components/game/BettingControls';
 import { JoinSeatModal } from '@/components/game/JoinSeatModal';
 import { SeatHostMenu } from '@/components/game/SeatHostMenu';
+import { HostJoinApprovals } from '@/components/game/HostJoinApprovals';
+import { TablePlayerControls } from '@/components/game/TablePlayerControls';
+import { TurnTimer } from '@/components/game/TurnTimer';
+import { RebuyBanner } from '@/components/game/RebuyBanner';
+import { TableBanner } from '@/components/game/TableBanner';
+import { messageFromGameApi } from '@/lib/game/safeErrors';
 import { formatStack } from '@/lib/formatStack';
 import type { Card, Player } from '@/types/game';
 
 export default function GamePage() {
   const { gameId } = useParams<{ gameId: string }>();
-  const { userId, loading: authLoading } = useAuth();
-  const { game, loading: gameLoading, refresh } = useGameState(gameId || '', userId);
+  const { userId, loading: authLoading, authError } = useAuth();
+  const { game, loading: gameLoading, error: loadError, refresh } = useGameState(
+    gameId || ''
+  );
   const [actionBusy, setActionBusy] = useState(false);
+  const [tableMessage, setTableMessage] = useState<{
+    text: string;
+    variant: 'error' | 'info';
+  } | null>(null);
 
   const loading = authLoading || gameLoading;
 
@@ -26,9 +38,13 @@ export default function GamePage() {
   const isMyTurn =
     !!game &&
     !!myPlayer &&
+    myPlayer.in_current_hand &&
     !!currentActor &&
     currentActor.user_id === userId &&
     isBettingPhase(game.status);
+
+  const myPendingJoin = game?.pending_joins?.find((j) => j.user_id === userId);
+  const turnTimeoutSent = useRef(false);
   const [seatMenu, setSeatMenu] = useState<{
     player: Player;
     x: number;
@@ -52,10 +68,21 @@ export default function GamePage() {
     const res = await fetch(`/api/game/${gameId}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
       body: JSON.stringify(body),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Action failed');
+    let data: { error?: string; code?: string } = {};
+    try {
+      data = await res.json();
+    } catch {
+      throw new Error('Server returned an invalid response. Try again.');
+    }
+    if (!res.ok) {
+      if (data.code === 'STALE_STATE') {
+        await refresh();
+      }
+      throw new Error(messageFromGameApi(data));
+    }
   };
 
   const openJoinModal = (seat: number) => {
@@ -78,43 +105,111 @@ export default function GamePage() {
     setJoinBusy(true);
     setJoinError(null);
     try {
-      const { joinSeat: joinAction } = await import('./actions');
-      await joinAction(gameId, joinModal.seat, displayName, stackCents);
+      const res = await fetch(`/api/game/${gameId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          action: 'requestJoin',
+          seat: joinModal.seat,
+          displayName,
+          startingStackCents: stackCents,
+        }),
+      });
+      let data: { error?: string; code?: string } = {};
+      try {
+        data = await res.json();
+      } catch {
+        setJoinError('Server returned an invalid response. Try again.');
+        return;
+      }
+      if (!res.ok) {
+        setJoinError(messageFromGameApi(data, 'Could not join seat'));
+        return;
+      }
       setJoinModal(null);
-    } catch (e) {
-      setJoinError(e instanceof Error ? e.message : 'Join failed');
+      await refresh();
+    } catch {
+      setJoinError('Could not join seat. Check your connection and try again.');
     } finally {
       setJoinBusy(false);
     }
   };
 
+  const runAction = async (body: Record<string, unknown>) => {
+    setActionBusy(true);
+    setTableMessage(null);
+    try {
+      await postGameAction(body);
+      await refresh();
+    } catch (e) {
+      setTableMessage({
+        text: e instanceof Error ? e.message : 'Action failed',
+        variant: 'error',
+      });
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleTurnTimeout = useCallback(
+    async (seat: number) => {
+      if (turnTimeoutSent.current) return;
+      turnTimeoutSent.current = true;
+      try {
+        await postGameAction({ action: 'turnTimeout', seat });
+        await refresh();
+      } catch {
+        /* ignore duplicate timeout */
+      }
+    },
+    [gameId, refresh]
+  );
+
   const handleAction = async (
     betAction: 'fold' | 'check' | 'call' | 'bet' | 'raise',
-    amount: number = 0
+    amount: number = 0,
+    options?: { confirmFreeFold?: boolean }
   ) => {
-    if (!game || !myPlayer) return alert('Take a seat first');
-    if (!isMyTurn) return alert('Not your turn');
+    if (!game || !myPlayer) {
+      throw new Error('Take a seat first.');
+    }
+    if (!isMyTurn) {
+      throw new Error('Not your turn.');
+    }
     setActionBusy(true);
+    setTableMessage(null);
     try {
       await postGameAction({
         action: 'bet',
         seat: myPlayer.seat,
         betAction,
         amount,
+        ...(options?.confirmFreeFold ? { confirmFreeFold: true } : {}),
       });
       await refresh();
     } catch (e) {
-      const message = e instanceof Error ? e.message : 'Action failed';
-      if (betAction === 'bet' || betAction === 'raise') {
-        throw new Error(message);
-      }
-      alert(message);
+      throw new Error(e instanceof Error ? e.message : 'Action failed');
     } finally {
       setActionBusy(false);
     }
   };
 
   if (loading) return <div className="p-4 text-center text-white">Loading table…</div>;
+  if (loadError) {
+    return (
+      <div className="p-4 text-center text-white space-y-3">
+        <p>{loadError}</p>
+        <button
+          type="button"
+          onClick={() => refresh()}
+          className="px-4 py-2 rounded bg-emerald-700 hover:bg-emerald-600 text-sm"
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
   if (!game) return <div className="p-4 text-center text-white">Game not found</div>;
 
   const topBoard = game.board.top.filter((c): c is Card => c !== null);
@@ -159,7 +254,7 @@ export default function GamePage() {
           {isHost && (
             <button
               type="button"
-              onClick={() => postGameAction({ action: 'startHand' }).catch((e) => alert(e.message))}
+              onClick={() => void runAction({ action: 'startHand' })}
               className="bg-emerald-600 hover:bg-emerald-500 px-3 py-1 rounded font-medium"
             >
               New Hand
@@ -167,6 +262,17 @@ export default function GamePage() {
           )}
         </div>
       </header>
+
+      {authError && (
+        <TableBanner message={authError} variant="error" />
+      )}
+      {tableMessage && (
+        <TableBanner
+          message={tableMessage.text}
+          variant={tableMessage.variant}
+          onDismiss={() => setTableMessage(null)}
+        />
+      )}
 
       <div className="flex-1 min-h-0 grid lg:grid-cols-12 gap-2 p-2 overflow-hidden">
         {/* Left: boards + table */}
@@ -236,8 +342,14 @@ export default function GamePage() {
                           <CardGrid cards={myPlayer.live_hole_cards} />
                         </div>
                       )}
-                      {player.status === 'dead' && (
-                        <span className="text-[9px] text-red-400">DEAD</span>
+                      {player.presence === 'away' && (
+                        <span className="text-[9px] text-zinc-400">AWAY</span>
+                      )}
+                      {!player.in_current_hand && player.presence === 'active' && (
+                        <span className="text-[9px] text-amber-400/90">WAIT</span>
+                      )}
+                      {player.status === 'dead' && player.in_current_hand && (
+                        <span className="text-[9px] text-red-400">OUT</span>
                       )}
                     </>
                   ) : (
@@ -257,6 +369,26 @@ export default function GamePage() {
 
         {/* Right: hand, showdown, host, actions */}
         <div className="lg:col-span-5 flex flex-col min-h-0 gap-2 overflow-y-auto">
+          {myPlayer && (
+            <>
+              <TablePlayerControls
+                game={game}
+                myPlayer={myPlayer}
+                busy={actionBusy}
+                onSetAway={() => void runAction({ action: 'setAway' })}
+                onStandUp={() => void runAction({ action: 'standUp' })}
+              />
+              <RebuyBanner
+                game={game}
+                mySeat={myPlayer.seat}
+                busy={actionBusy}
+                onRebuy={(cents) =>
+                  void runAction({ action: 'rebuy', startingStackCents: cents })
+                }
+              />
+            </>
+          )}
+
           {myPlayer && (
             <div className="bg-zinc-900 border border-amber-700/50 rounded-lg p-2 shrink-0">
               <div className="text-amber-400 text-[10px] font-medium uppercase mb-1">
@@ -320,13 +452,24 @@ export default function GamePage() {
           )}
 
           <div className="bg-zinc-900 rounded-lg p-2 mt-auto shrink-0">
+            <TurnTimer
+              deadline={game.turn_deadline_at}
+              isMyTurn={isMyTurn}
+              seat={myPlayer?.seat ?? 0}
+              onTimeout={handleTurnTimeout}
+            />
             <p className="text-center text-emerald-400 text-xs mb-2">
               {currentActor
                 ? `${currentActor.display_name} to act`
                 : 'Waiting…'}
             </p>
-            {!myPlayer && (
+            {!myPlayer && !myPendingJoin && (
               <p className="text-center text-zinc-500 text-xs">Join a seat</p>
+            )}
+            {myPendingJoin && (
+              <p className="text-center text-amber-300 text-xs">
+                Seat {myPendingJoin.seat} requested — waiting for host
+              </p>
             )}
             {myPlayer && !isMyTurn && isBettingPhase(game.status) && (
               <p className="text-center text-zinc-500 text-xs">Your turn soon</p>
@@ -344,12 +487,21 @@ export default function GamePage() {
         </div>
       </div>
 
+      {isHost && (game.pending_joins?.length ?? 0) > 0 && (
+        <HostJoinApprovals
+          game={game}
+          busy={actionBusy}
+          onApprove={(requestId) => void runAction({ action: 'approveJoin', requestId })}
+          onDeny={(requestId) => void runAction({ action: 'denyJoin', requestId })}
+        />
+      )}
+
       <JoinSeatModal
         open={!!joinModal}
-        title="Join the table"
-        subtitle="Choose a display name and starting stack."
+        title="Request a seat"
+        subtitle="The host will approve. You will not be dealt into the current hand if one is in progress."
         seat={joinModal?.seat}
-        submitLabel="Take seat"
+        submitLabel="Request seat"
         busy={joinBusy}
         error={joinError}
         onClose={() => !joinBusy && setJoinModal(null)}
@@ -363,7 +515,10 @@ export default function GamePage() {
           x={seatMenu.x}
           y={seatMenu.y}
           onClose={() => setSeatMenu(null)}
-          onHostAction={postGameAction}
+          onHostAction={async (payload) => {
+            await postGameAction(payload);
+            await refresh();
+          }}
         />
       )}
     </div>

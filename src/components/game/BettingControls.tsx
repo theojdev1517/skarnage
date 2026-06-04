@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from 'react';
 import type { GameState, Player } from '@/types/game';
 import { getWagerBounds, validateWagerTo } from '@/lib/game/bettingLimits';
 import { dollarsToCents, formatStack } from '@/lib/formatStack';
+import { ConfirmModal } from '@/components/game/ConfirmModal';
 
 type BettingControlsProps = {
   game: GameState;
@@ -12,7 +13,8 @@ type BettingControlsProps = {
   busy?: boolean;
   onAction: (
     betAction: 'fold' | 'check' | 'call' | 'bet' | 'raise',
-    amountCents?: number
+    amountCents?: number,
+    options?: { confirmFreeFold?: boolean }
   ) => void | Promise<void>;
 };
 
@@ -35,6 +37,7 @@ export function BettingControls({
   const defaultWagerTo = bounds?.minWagerTo ?? game.blinds.big;
   const [wagerInput, setWagerInput] = useState(() => (defaultWagerTo / 100).toString());
   const [wagerError, setWagerError] = useState<string | null>(null);
+  const [foldConfirmOpen, setFoldConfirmOpen] = useState(false);
 
   useEffect(() => {
     if (bounds) setWagerInput((bounds.minWagerTo / 100).toString());
@@ -69,8 +72,45 @@ export function BettingControls({
     setWagerInput((cents / 100).toString());
   };
 
+  const runBetAction = async (
+    betAction: 'fold' | 'check' | 'call' | 'bet' | 'raise',
+    amount = 0,
+    options?: { confirmFreeFold?: boolean }
+  ) => {
+    try {
+      await onAction(betAction, amount, options);
+      setWagerError(null);
+    } catch (e) {
+      setWagerError(e instanceof Error ? e.message : 'Action failed');
+    }
+  };
+
+  const handleFoldClick = () => {
+    if (facingBet) {
+      void runBetAction('fold');
+      return;
+    }
+    setFoldConfirmOpen(true);
+  };
+
+  const confirmFold = async () => {
+    setFoldConfirmOpen(false);
+    await runBetAction('fold', 0, { confirmFreeFold: true });
+  };
+
   return (
     <div className="space-y-2">
+      <ConfirmModal
+        open={foldConfirmOpen}
+        title="Fold when you can check?"
+        message="There is no bet to you. You can check for free instead of folding and giving up the pot."
+        confirmLabel="Fold anyway"
+        cancelLabel="Keep hand"
+        variant="danger"
+        busy={busy}
+        onCancel={() => setFoldConfirmOpen(false)}
+        onConfirm={() => void confirmFold()}
+      />
       {bounds && (
         <div className="text-[10px] text-zinc-500 text-center space-y-0.5">
           {bounds.toCall > 0 && (
@@ -141,7 +181,7 @@ export function BettingControls({
         <button
           type="button"
           disabled={busy}
-          onClick={() => onAction('fold')}
+          onClick={handleFoldClick}
           className="py-2 rounded text-xs font-medium bg-red-700 hover:bg-red-600 disabled:opacity-50"
         >
           Fold
@@ -151,7 +191,7 @@ export function BettingControls({
             <button
               type="button"
               disabled={busy}
-              onClick={() => onAction('call')}
+              onClick={() => void runBetAction('call')}
               className="py-2 rounded text-xs font-medium bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
             >
               Call{bounds && bounds.toCall > 0 ? ` ${formatStack(bounds.toCall)}` : ''}
@@ -170,7 +210,7 @@ export function BettingControls({
             <button
               type="button"
               disabled={busy}
-              onClick={() => onAction('check')}
+              onClick={() => void runBetAction('check')}
               className="py-2 rounded text-xs font-medium bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
             >
               Check

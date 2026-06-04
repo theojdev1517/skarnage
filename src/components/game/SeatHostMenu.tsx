@@ -25,6 +25,7 @@ export function SeatHostMenu({
   const [removeAmount, setRemoveAmount] = useState('');
   const [setAmount, setSetAmount] = useState('');
   const [busy, setBusy] = useState(false);
+  const [menuError, setMenuError] = useState<string | null>(null);
 
   useEffect(() => {
     const close = () => onClose();
@@ -37,11 +38,12 @@ export function SeatHostMenu({
 
   const run = async (payload: Record<string, unknown>) => {
     setBusy(true);
+    setMenuError(null);
     try {
       await onHostAction(payload);
       onClose();
     } catch (e) {
-      alert(e instanceof Error ? e.message : 'Host action failed');
+      setMenuError(e instanceof Error ? e.message : 'Host action failed');
     } finally {
       setBusy(false);
     }
@@ -61,6 +63,12 @@ export function SeatHostMenu({
           {player.display_name} · seat {player.seat} · {formatStack(player.stack)}
         </div>
 
+        {menuError && (
+          <p className="mx-2 mt-2 text-red-400 text-xs bg-red-950/40 border border-red-900/50 rounded px-2 py-1.5">
+            {menuError}
+          </p>
+        )}
+
         <div className="px-2 py-2 space-y-2 border-b border-zinc-800">
           <div className="text-[10px] uppercase text-zinc-500 tracking-wide">Add to stack</div>
           <div className="flex gap-1">
@@ -77,7 +85,10 @@ export function SeatHostMenu({
               disabled={busy}
               onClick={() => {
                 const cents = dollarsToCents(addAmount);
-                if (cents === null || cents <= 0) return alert('Enter a valid amount');
+                if (cents === null || cents <= 0) {
+                  setMenuError('Enter a valid amount greater than zero.');
+                  return;
+                }
                 run({ action: 'hostAddStack', seat: player.seat, amountCents: cents });
               }}
               className="px-2 py-1 rounded bg-emerald-800 text-xs disabled:opacity-50"
@@ -101,7 +112,10 @@ export function SeatHostMenu({
               disabled={busy}
               onClick={() => {
                 const cents = dollarsToCents(removeAmount);
-                if (cents === null || cents <= 0) return alert('Enter a valid amount');
+                if (cents === null || cents <= 0) {
+                  setMenuError('Enter a valid amount greater than zero.');
+                  return;
+                }
                 run({ action: 'hostRemoveStack', seat: player.seat, amountCents: cents });
               }}
               className="px-2 py-1 rounded bg-red-900/80 text-xs disabled:opacity-50"
@@ -125,7 +139,10 @@ export function SeatHostMenu({
               disabled={busy}
               onClick={() => {
                 const cents = dollarsToCents(setAmount);
-                if (cents === null) return alert('Enter a valid amount');
+                if (cents === null) {
+                  setMenuError('Enter a valid stack amount.');
+                  return;
+                }
                 run({ action: 'hostSetStack', seat: player.seat, stackCents: cents });
               }}
               className="px-2 py-1 rounded bg-amber-800 text-xs disabled:opacity-50"

@@ -3,8 +3,9 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { createClient } from '@/lib/supabase';
 import type { GameState } from '@/types/game';
+import { messageFromGameApi } from '@/lib/game/safeErrors';
 
-export function useGameState(gameId: string, _userId: string | null) {
+export function useGameState(gameId: string) {
   const [game, setGame] = useState<GameState | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -14,11 +15,19 @@ export function useGameState(gameId: string, _userId: string | null) {
   const fetchGame = useCallback(async () => {
     if (!gameId) return;
     const res = await fetch(`/api/game/${gameId}`, { credentials: 'include' });
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error || 'Failed to load game');
+    let data: { error?: string; code?: string; game?: GameState } = {};
+    try {
+      data = await res.json();
+    } catch {
+      throw new Error('Could not read table data. Try again.');
     }
-    setGame(data.game as GameState);
+    if (!res.ok) {
+      throw new Error(messageFromGameApi(data, 'Failed to load game'));
+    }
+    if (!data.game) {
+      throw new Error('Table data was missing from the server.');
+    }
+    setGame(data.game);
   }, [gameId]);
 
   useEffect(() => {
@@ -56,7 +65,9 @@ export function useGameState(gameId: string, _userId: string | null) {
           filter: `id=eq.${gameId}`,
         },
         () => {
-          fetchGame().catch(() => {});
+          fetchGame().catch((e) => {
+            setError(e instanceof Error ? e.message : 'Failed to refresh table');
+          });
         }
       )
       .subscribe();

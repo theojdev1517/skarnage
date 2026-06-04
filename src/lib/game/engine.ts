@@ -1,40 +1,39 @@
-// src/lib/game/engine.ts
 import type { GameState, Player, Card, GameStatus, ShowdownSummary } from "@/types/game";
 import type { HandEvaluation } from "./evaluator";
 import { evaluateHighHand, parseCardRank } from "./evaluator";
 import { validateWagerTo } from "./bettingLimits";
+import {
+  defaultPlayerFields,
+  isInLiveHand,
+  shouldDealCardsTo,
+  withTurnDeadline,
+} from "./playerLifecycle";
+import {
+  applySeatIntentAfterFold,
+  assertTurnTimerExpired,
+  openRebuyWindow,
+  preparePlayersForNewHand,
+  activateEligiblePlayersForHand,
+} from "./seatManagement";
+import {
+  isHeadsUpHand,
+  isHeadsUpTable,
+  normalizeButtonSeat,
+  recordBlindsPosted,
+  resolveBlindSeats,
+  seatsThatSkippedBlinds,
+} from "./blindPositions";
+import { GameApiError, GameErrorCode } from "./apiErrors";
+import {
+  assertShowdownReady,
+  buildPayouts,
+  buildShowdownSummary,
+  assertPayoutsCoverPot,
+  resolveShowdown,
+} from "./showdown";
+import { now } from "./time";
 
-export function now(): string {
-  return new Date().toISOString();
-}
-
-// Game Creation & Joining
-
-/** Empty table — no players; first seated player becomes host (set in join flow). */
-export function createEmptyTable(gameId: string): GameState {
-  return {
-    game_id: gameId,
-    host_id: "",
-    hand_number: 0,
-    status: "waiting",
-    updated_at: now(),
-    pot: 0,
-    current_wager: 0,
-    min_raise: 0,
-    blinds: { small: 25, big: 50 },
-    board: { top: [null, null, null, null, null, null], shredder: [null, null, null, null, null, null] },
-    players: [],
-    current_player_seat: null,
-    button_seat: 1,
-    last_aggressor_seat: null,
-    skip_discard_eligible: false,
-    side_pots: [],
-    action_history: [],
-    last_action: "Table open — take a seat to play",
-    deck: [],
-    deck_index: 0,
-  };
-}
+export { now };
 
 export function createNewGame(
   gameId: string,
@@ -44,7 +43,7 @@ export function createNewGame(
 ): GameState {
   if (startingStackCents < 0) throw new Error("Starting stack cannot be negative");
 
-  const hostPlayer: Player = {
+  const hostPlayer = defaultPlayerFields({
     user_id: hostId,
     seat: 1,
     display_name: hostName,
@@ -59,7 +58,9 @@ export function createNewGame(
     current_pip_total: 0,
     final_pip_total: null,
     hand_result: null,
-  };
+    in_current_hand: false,
+    waits_for_button: false,
+  });
 
   return {
     game_id: gameId,
@@ -82,45 +83,13 @@ export function createNewGame(
     last_action: `${hostName} created the table (seat 1, ${formatChips(startingStackCents)} chips)`,
     deck: [],
     deck_index: 0,
+    pending_joins: [],
+    turn_deadline_at: null,
+    rebuy_deadline_at: null,
+    rebuy_offered_seats: [],
   };
 }
 
-export function joinSeat(
-  game: GameState,
-  userId: string,
-  seat: number,
-  displayName: string,
-  startingStackCents: number
-): GameState {
-  if (startingStackCents < 0) throw new Error("Starting stack cannot be negative");
-  if (game.players.some(p => p.seat === seat)) throw new Error("Seat already taken");
-
-  const newPlayer: Player = {
-    user_id: userId,
-    seat,
-    display_name: displayName,
-    stack: startingStackCents,
-    contributed_this_hand: 0,
-    bet_this_street: 0,
-    hole_cards: [],
-    live_hole_cards: [],
-    shredded_cards: [],
-    discard_submitted: false,
-    status: "active",
-    current_pip_total: 0,
-    final_pip_total: null,
-    hand_result: null,
-  };
-
-  return {
-    ...game,
-    players: [...game.players, newPlayer].sort((a, b) => a.seat - b.seat),
-    updated_at: now(),
-    last_action: `${displayName} joined seat ${seat}`,
-  };
-}
-
-// Card Utilities & Dealing
 export function createStandardDeck(): Card[] {
   const suits = ['h', 'd', 'c', 's'];
   const ranks = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
@@ -192,7 +161,19 @@ export function dealHoleCards(game: GameState): GameState {
   let newGame = { ...game };
   let idx = newGame.deck_index;
 
-  const updatedPlayers = newGame.players.map(player => {
+  const updatedPlayers = newGame.players.map((player) => {
+    if (!shouldDealCardsTo(player)) {
+      return {
+        ...player,
+        hole_cards: [],
+        live_hole_cards: [],
+        shredded_cards: [],
+        current_pip_total: 0,
+        discard_submitted: false,
+        in_current_hand: false,
+        status: "active" as const,
+      };
+    }
     const holeCards: Card[] = [];
     for (let i = 0; i < 5; i++) {
       holeCards.push(newGame.deck[idx++]);
@@ -204,13 +185,15 @@ export function dealHoleCards(game: GameState): GameState {
       shredded_cards: [],
       current_pip_total: calculatePipTotal(holeCards),
       discard_submitted: false,
+      in_current_hand: true,
     };
   });
 
   newGame.players = updatedPlayers;
   newGame.deck_index = idx;
   newGame.status = 'preflop_betting' as GameStatus;
-  newGame.last_action = `Dealt 5 hole cards to ${newGame.players.length} players`;
+  const dealtCount = updatedPlayers.filter((p) => p.live_hole_cards.length > 0).length;
+  newGame.last_action = `Dealt 5 hole cards to ${dealtCount} player${dealtCount === 1 ? '' : 's'}`;
 
   return newGame;
 }
@@ -295,20 +278,17 @@ export function dealRiver(game: GameState): GameState {
   return newGame;
 }
 
-// Betting System
-export function getNextPlayerSeat(game: GameState, currentSeat: number): number | null {
-  const active = game.players.filter(p => p.status === "active").sort((a, b) => a.seat - b.seat);
-  if (active.length === 0) return null;
-  const idx = active.findIndex(p => p.seat === currentSeat);
-  if (idx === -1) return active[0].seat;
-  return active[(idx + 1) % active.length].seat;
+export function countBettingPlayers(game: GameState): number {
+  return game.players.filter(
+    (p) =>
+      p.in_current_hand && (p.status === "active" || p.status === "all_in")
+  ).length;
 }
 
-// src/lib/game/engine.ts  (update these functions)
-
 export function isBettingRoundComplete(game: GameState): boolean {
-  const activePlayers = game.players.filter(p => 
-    p.status === 'active' || p.status === 'all_in'
+  const activePlayers = game.players.filter(
+    (p) =>
+      p.in_current_hand && (p.status === 'active' || p.status === 'all_in')
   );
 
   if (activePlayers.length <= 1) return true;
@@ -331,16 +311,22 @@ export function isBettingRoundComplete(game: GameState): boolean {
     return game.hasBigBlindActedThisStreet === true;
   } else {
     // Postflop: complete when back to first-to-act (left of button)
-    const firstToAct = getNextActiveSeat(game, game.button_seat || 0)!;
-    return game.current_player_seat === firstToAct;
+    const firstToAct = getNextActiveSeat(game, game.button_seat || 0);
+    return firstToAct != null && game.current_player_seat === firstToAct;
   }
 }
+
+export type ProcessBetOptions = {
+  /** Player confirmed folding when they could check for free. */
+  confirmFreeFold?: boolean;
+};
 
 export function processBet(
   game: GameState,
   seat: number,
   action: "fold" | "check" | "call" | "bet" | "raise",
-  amount: number = 0
+  amount: number = 0,
+  options?: ProcessBetOptions
 ): GameState {
   const playerIndex = game.players.findIndex(p => p.seat === seat);
   if (playerIndex === -1) throw new Error("Player not found");
@@ -349,6 +335,9 @@ export function processBet(
 
   if (seat !== game.current_player_seat) {
     throw new Error(`Not your turn! Current: ${game.current_player_seat}`);
+  }
+  if (!player.in_current_hand) {
+    throw new Error("You are not in this hand");
   }
   if (!["active", "all_in"].includes(player.status)) {
     throw new Error("Player cannot act");
@@ -362,6 +351,14 @@ export function processBet(
   let lastActionText = "";
 
   const toCall = Math.max(0, oldWager - player.bet_this_street);
+
+  if (action === "fold" && toCall <= 0 && !options?.confirmFreeFold) {
+    throw new GameApiError(
+      GameErrorCode.FOLD_NOT_REQUIRED,
+      "You can check — there is no bet to you.",
+      400
+    );
+  }
 
   if (action === "fold") {
     updatedPlayers[playerIndex] = { ...player, status: "folded" as const };
@@ -415,6 +412,8 @@ export function processBet(
     newMinRaise = newWager - oldWager;
     newAggressor = seat;
     lastActionText = `${player.display_name} raised to ${formatCents(newWager)}`;
+  } else {
+    throw new Error(`Invalid betting action: ${action}`);
   }
 
   const newPot = updatedPlayers.reduce((sum, p) => sum + p.contributed_this_hand, 0);
@@ -426,7 +425,7 @@ export function processBet(
     current_wager: newWager,
     min_raise: newMinRaise,
     last_aggressor_seat: newAggressor,
-    current_player_seat: getNextActiveSeat(game, seat)!,
+    current_player_seat: requireNextActorSeat(game, seat),
     updated_at: now(),
     last_action: lastActionText,
     hasBigBlindActedThisStreet: 
@@ -436,6 +435,26 @@ export function processBet(
         : game.hasBigBlindActedThisStreet,
   };
 
+  if (action === 'fold') {
+    result = applySeatIntentAfterFold(result, seat);
+  }
+
+  if (countBettingPlayers(result) <= 1) {
+    const winner = result.players.find(
+      (p) =>
+        p.in_current_hand && (p.status === "active" || p.status === "all_in")
+    );
+    return awardPot({
+      ...result,
+      status: "showdown",
+      current_player_seat: null,
+      turn_deadline_at: null,
+      last_action: winner
+        ? `${winner.display_name} wins the pot (everyone else folded)`
+        : result.last_action,
+    });
+  }
+
   if (isBettingRoundComplete(result)) {
     result = advanceToNextPhase(result);
     if (result.status === 'showdown') {
@@ -443,7 +462,16 @@ export function processBet(
     }
   }
 
-  return result;
+  return withTurnDeadline(result);
+}
+
+export function applyTurnTimeout(game: GameState, seat: number): GameState {
+  assertTurnTimerExpired(game, seat);
+  const player = game.players.find((p) => p.seat === seat);
+  if (!player) throw new Error('Player not found');
+  const toCall = Math.max(0, (game.current_wager ?? 0) - player.bet_this_street);
+  const betAction = toCall > 0 ? 'fold' : 'check';
+  return processBet(game, seat, betAction, 0);
 }
 
 
@@ -454,57 +482,6 @@ export function evaluatePlayerHand(player: Player, topBoard: (Card | null)[]): H
   return evaluateHighHand(liveCards, community);
 }
 
-export interface ShowdownResult {
-  highWinners: Player[];
-  lowWinners: Player[];
-  highEvaluation?: HandEvaluation;
-  lowPips: number;
-  highPotShare: number;
-  lowPotShare: number;
-}
-
-export function determineShowdown(game: GameState): ShowdownResult {
-  const activePlayers = game.players.filter(p => 
-    isHandLive(p) && p.live_hole_cards.length > 0
-  );
-  if (activePlayers.length === 0) return { highWinners: [], lowWinners: [], lowPips: Infinity, highPotShare: 0, lowPotShare: 0 };
-
-  let bestHighScore = -1;
-  let highWinners: Player[] = [];
-  let bestLow = Infinity;
-  let lowWinners: Player[] = [];
-  let bestHighEval: HandEvaluation | undefined;
-
-  for (const player of activePlayers) {
-    const highEval = evaluatePlayerHand(player, game.board.top);
-    const lowPips = player.current_pip_total;
-
-    if (highEval.score > bestHighScore) {
-      highWinners = [player];
-      bestHighScore = highEval.score;
-      bestHighEval = highEval;
-    } else if (highEval.score === bestHighScore) highWinners.push(player);
-
-    if (lowPips < bestLow) {
-      lowWinners = [player];
-      bestLow = lowPips;
-    } else if (lowPips === bestLow) lowWinners.push(player);
-  }
-
-  const totalPot = game.pot;
-  const highShare = Math.floor(totalPot / 2);
-  const lowShare = totalPot - highShare;
-
-  return {
-    highWinners,
-    lowWinners,
-    highEvaluation: bestHighEval,
-    lowPips: bestLow,
-    highPotShare: highShare,
-    lowPotShare: lowShare,
-  };
-}
-
 function formatChips(cents: number): string {
   return (cents / 100).toFixed(2);
 }
@@ -512,52 +489,32 @@ function formatChips(cents: number): string {
 const formatCents = formatChips;
 
 export function awardPot(game: GameState): GameState {
-  const result = determineShowdown(game);
+  assertShowdownReady(game);
+  const resolution = resolveShowdown(game);
+  const payouts = buildPayouts(resolution);
+  assertPayoutsCoverPot(game, payouts);
+
   const updatedPlayers = [...game.players];
-
-  const highWinnersSet = new Set(result.highWinners.map((p) => p.user_id));
-  const lowWinnersSet = new Set(result.lowWinners.map((p) => p.user_id));
-  const highPerWinner =
-    result.highWinners.length > 0
-      ? Math.floor(result.highPotShare / result.highWinners.length)
-      : 0;
-  const lowPerWinner =
-    result.lowWinners.length > 0
-      ? Math.floor(result.lowPotShare / result.lowWinners.length)
-      : 0;
-
-  const showdown_summary: ShowdownSummary = {
-    high_winners: result.highWinners.map((p) => ({
-      seat: p.seat,
-      display_name: p.display_name,
-      amount_cents: highPerWinner,
-      hand_description: evaluatePlayerHand(p, game.board.top).description,
-    })),
-    low_winners: result.lowWinners.map((p) => ({
-      seat: p.seat,
-      display_name: p.display_name,
-      amount_cents: lowPerWinner,
-      pips: p.current_pip_total,
-    })),
-  };
+  const showdown_summary = buildShowdownSummary(resolution, payouts);
 
   for (let i = 0; i < updatedPlayers.length; i++) {
     const p = updatedPlayers[i];
-    let winnings = 0;
-    if (highWinnersSet.has(p.user_id)) winnings += highPerWinner;
-    if (lowWinnersSet.has(p.user_id)) winnings += lowPerWinner;
+    const winnings = payouts.get(p.user_id) ?? 0;
+    if (winnings <= 0) continue;
 
-    if (winnings > 0) {
-      updatedPlayers[i] = {
-        ...p,
-        stack: p.stack + winnings,
-        hand_result: {
-          high: evaluatePlayerHand(p, game.board.top),
-          lowPips: p.current_pip_total,
-          winnings,
-        },
-      };
-    }
+    const highEval =
+      resolution.evaluations.get(p.user_id) ??
+      evaluatePlayerHand(p, game.board.top);
+
+    updatedPlayers[i] = {
+      ...p,
+      stack: p.stack + winnings,
+      hand_result: {
+        high: highEval,
+        lowPips: p.current_pip_total,
+        winnings,
+      },
+    };
   }
 
   const highNames = showdown_summary.high_winners
@@ -567,14 +524,15 @@ export function awardPot(game: GameState): GameState {
     .map((w) => `${w.display_name} (${w.pips} pips, ${formatCents(w.amount_cents)})`)
     .join('; ');
 
-  const last_action = [
-    highNames ? `High: ${highNames}` : null,
-    lowNames ? `Low: ${lowNames}` : null,
-  ]
-    .filter(Boolean)
-    .join(' · ');
+  const last_action = resolution.uncontested
+    ? showdown_summary.high_winners[0]
+      ? `${showdown_summary.high_winners[0].display_name} wins ${formatCents(game.pot)} (uncontested)`
+      : 'Hand complete (uncontested)'
+    : [highNames ? `High: ${highNames}` : null, lowNames ? `Low: ${lowNames}` : null]
+        .filter(Boolean)
+        .join(' · ');
 
-  return {
+  const finished = {
     ...game,
     players: updatedPlayers,
     pot: 0,
@@ -582,118 +540,46 @@ export function awardPot(game: GameState): GameState {
     updated_at: now(),
     last_action: last_action || 'Hand complete (no eligible winners)',
     showdown_summary,
+    turn_deadline_at: null,
   };
+  return openRebuyWindow(finished);
 }
 
-export function nextHand(game: GameState): GameState {
-  const newHandNumber = game.hand_number + 1;
-  const resetPlayers = game.players.map(p => ({
-    ...p,
-    hole_cards: [],
-    live_hole_cards: [],
-    shredded_cards: [],
-    contributed_this_hand: 0,
-    bet_this_street: 0,
-    discard_submitted: false,
-    status: "active" as const,
-    current_pip_total: 0,
-    final_pip_total: null,
-    hand_result: null,
-  }));
-
-  return {
-    ...game,
-    players: resetPlayers,
-    hand_number: newHandNumber,
-    pot: 0,
-    current_wager: 0,
-    min_raise: 0,
-    board: { top: [null, null, null, null, null, null], shredder: [null, null, null, null, null, null] },
-    current_player_seat: null,
-    last_aggressor_seat: null,
-    status: "waiting" as GameStatus,
-    updated_at: now(),
-    last_action: `Hand ${newHandNumber} reset`,
-    action_history: [],
-  };
-}
-
-// probably not needed from an older iteration
-/* export function advanceStreet(game: GameState): GameState {
-  let newGame = { ...game };
-
-  // Reset street bets
-  newGame.players = newGame.players.map(p => ({
-    ...p,
-    bet_this_street: 0,
-  }));
-
-  newGame.current_wager = 0;
-  newGame.last_aggressor_seat = null;
-
-  const isPostflop = ['flop_betting', 'turn_betting', 'river_betting'].includes(newGame.status);
-
-  if (newGame.status === 'preflop_betting') {
-    newGame.status = 'flop_betting' as GameStatus;
-    newGame.current_player_seat = getFirstToAct(newGame, 'postflop');
-    newGame.last_action = 'Advanced to flop betting';
-  } 
-  else if (newGame.status === 'flop_betting') {
-    newGame.status = 'turn_betting' as GameStatus;
-    newGame.current_player_seat = getFirstToAct(newGame, 'postflop');
-    newGame.last_action = 'Advanced to turn betting';
-  } 
-  else if (newGame.status === 'turn_betting') {
-    newGame.status = 'river_betting' as GameStatus;
-    newGame.current_player_seat = getFirstToAct(newGame, 'postflop');
-    newGame.last_action = 'Advanced to river betting';
-  } 
-  else if (newGame.status === 'river_betting') {
-    newGame.status = 'showdown' as GameStatus;
-    newGame.current_player_seat = null;
-    newGame.last_action = 'Advanced to showdown';
+function firstActiveSeat(state: GameState, preferred: number | null): number | null {
+  const active = getActivePlayers(state);
+  if (active.length === 0) return null;
+  if (preferred != null && active.some((p) => p.seat === preferred)) {
+    return preferred;
   }
-
-  newGame.updated_at = now();
-  return newGame;
+  return active[0]?.seat ?? null;
 }
-  */
-
-// ======================
-// NEW: BUTTON ROTATION + BLIND POSTING (pure functions added at the end)
-// ======================
-
-// ======================
-// POSITION HELPERS (add these)
-// ======================
 
 export function getFirstToAct(state: GameState, street: 'preflop' | 'postflop'): number | null {
   if (getActivePlayers(state).length === 0) return null;
 
   if (street === 'preflop') {
-    // Preflop: after the Big Blind
-    const bbSeat = state.players.find(p => 
-      p.bet_this_street === state.blinds.big && p.contributed_this_hand > 0
-    )?.seat ?? state.button_seat;
-    return getNextActiveSeat(state, bbSeat);
-  } 
+    // Heads-up: dealer (button / SB) acts first preflop
+    if (isHeadsUpHand(state) || isHeadsUpTable(state)) {
+      return firstActiveSeat(state, state.button_seat);
+    }
+    return getNextActiveSeat(state, getBigBlindSeat(state));
+  }
 
-  // POSTFLOP: Always the player to the LEFT of the button (Small Blind position)
-  // This is the key fix — we were sometimes landing on the button itself
-  return getNextActiveSeat(state, state.button_seat);
+  // Postflop (HU and multi): first active seat left of button (BB in HU)
+  return firstActiveSeat(state, getNextActiveSeat(state, state.button_seat));
 }
 
-export function isActive(player: Player): boolean {
-  return player.status === 'active';
+export function getSeatedPlayers(state: GameState): Player[] {
+  return state.players.filter((p) => p.presence === 'active' && p.stack > 0);
 }
 
 export function getActivePlayers(state: GameState): Player[] {
-  return state.players.filter(isActive);
+  return state.players.filter((p) => isInLiveHand(p));
 }
 
 export function getNextActiveSeat(game: GameState, fromSeat: number): number | null {
   const active = game.players
-    .filter(p => p.status === 'active' || p.status === 'all_in')
+    .filter((p) => p.in_current_hand && (p.status === 'active' || p.status === 'all_in'))
     .sort((a, b) => a.seat - b.seat);
 
   if (active.length === 0) return null;
@@ -704,17 +590,35 @@ export function getNextActiveSeat(game: GameState, fromSeat: number): number | n
   return active[(idx + 1) % active.length].seat;
 }
 
-export function rotateButton(state: GameState): GameState {
-  if (getActivePlayers(state).length === 0) return state;
+export function requireNextActorSeat(game: GameState, fromSeat: number): number {
+  const next = getNextActiveSeat(game, fromSeat);
+  if (next != null) return next;
+  throw new GameApiError(
+    GameErrorCode.INVALID_STATE,
+    'Could not find the next player to act. Refresh the table or start a new hand.',
+    500
+  );
+}
 
-  const nextButtonSeat = getNextActiveSeat(state, state.button_seat) ?? state.button_seat;
+export function rotateButton(state: GameState): GameState {
+  const seated = getSeatedPlayers(state);
+  if (seated.length === 0) return state;
+
+  const sorted = [...seated].sort((a, b) => a.seat - b.seat);
+  const idx = sorted.findIndex((p) => p.seat === state.button_seat);
+  const next = sorted[(idx + 1) % sorted.length]?.seat ?? state.button_seat;
 
   return {
     ...state,
-    button_seat: nextButtonSeat,
+    button_seat: next,
+    players: state.players.map((p) =>
+      p.waits_for_button && p.seat === next
+        ? { ...p, waits_for_button: false }
+        : p
+    ),
     current_player_seat: null,
     updated_at: now(),
-    last_action: `Button rotated to seat ${nextButtonSeat}`,
+    last_action: `Button rotated to seat ${next}`,
   };
 }
 
@@ -744,52 +648,88 @@ export function postBlinds(state: GameState): GameState {
   const active = getActivePlayers(state);
   if (active.length < 2) return state;
 
-  let workingState = { ...state };
+  let workingState: GameState = {
+    ...state,
+    button_seat: normalizeButtonSeat(state),
+  };
 
-  const buttonIndex = workingState.players.findIndex(p => p.seat === workingState.button_seat);
-  let sbSeat: number | null = null;
-  let bbSeat: number | null = null;
+  let assignment = resolveBlindSeats(workingState);
+  if (!assignment) return state;
 
-  for (let i = 1; i <= workingState.players.length; i++) {
-    const idx = (buttonIndex + i) % workingState.players.length;
-    const p = workingState.players[idx];
-    if (isActive(p)) {
-      if (sbSeat === null) sbSeat = p.seat;
-      else if (bbSeat === null) { bbSeat = p.seat; break; }
+  if (
+    assignment.bigBlindSeat === workingState.last_blinds?.big_seat &&
+    assignment.bigBlindSeat === workingState.prior_blinds?.big_seat
+  ) {
+    workingState = rotateButton(workingState);
+    workingState = { ...workingState, button_seat: normalizeButtonSeat(workingState) };
+    assignment = resolveBlindSeats(workingState) ?? assignment;
+  }
+
+  if (
+    assignment.smallBlindSeat != null &&
+    assignment.smallBlindSeat === workingState.last_blinds?.small_seat &&
+    assignment.smallBlindSeat === workingState.prior_blinds?.small_seat
+  ) {
+    assignment = { ...assignment, smallBlindSeat: null, deadSmallBlind: true };
+  }
+
+  const skipped = seatsThatSkippedBlinds(
+    workingState,
+    workingState.last_blinds,
+    assignment
+  );
+  if (skipped.length === 1) {
+    const seat = skipped[0];
+    if (seat !== assignment.bigBlindSeat && seat !== assignment.smallBlindSeat) {
+      assignment = { ...assignment, bigBlindSeat: seat };
     }
   }
 
-  if (!sbSeat || !bbSeat) return workingState;
+  let sbSeat = assignment.smallBlindSeat;
+  const bbSeat = assignment.bigBlindSeat;
 
-  workingState = postBlind(workingState, sbSeat, workingState.blinds.small);
+  if (sbSeat != null) {
+    workingState = postBlind(workingState, sbSeat, workingState.blinds.small);
+  }
   workingState = postBlind(workingState, bbSeat, workingState.blinds.big);
 
   const newPot = workingState.players.reduce((sum, p) => sum + p.contributed_this_hand, 0);
- const firstToAct = getFirstToAct(workingState, 'preflop');
-  return {
+  const firstToAct = getFirstToAct(workingState, "preflop");
+  const blindRecord = recordBlindsPosted(assignment, workingState.hand_number || 1);
+
+  const posted = {
     ...workingState,
     pot: newPot,
     current_wager: workingState.blinds.big,
     min_raise: workingState.blinds.big,
     current_player_seat: firstToAct,
     last_aggressor_seat: null,
-    status: 'preflop_betting' as GameStatus,
-    last_action: 'blinds_posted',
+    status: "preflop_betting" as GameStatus,
+    last_action: assignment.deadSmallBlind
+      ? "Blinds posted (dead small blind)"
+      : "Blinds posted",
+    prior_blinds: workingState.last_blinds,
+    last_blinds: blindRecord,
     action_history: [
       ...(workingState.action_history || []),
       {
-        type: 'blinds_posted',
-        small_blind: { seat: sbSeat, amount: workingState.blinds.small },
+        type: "blinds_posted",
+        small_blind: sbSeat != null ? { seat: sbSeat, amount: workingState.blinds.small } : null,
         big_blind: { seat: bbSeat, amount: workingState.blinds.big },
+        dead_small_blind: assignment.deadSmallBlind,
+        dead_button: assignment.deadButton,
         timestamp: now(),
       },
     ],
     updated_at: now(),
   };
+  return withTurnDeadline(posted);
 }
 
 export function startNewHand(game: GameState): GameState {
-  let newGame = rotateButton(game);
+  let newGame = preparePlayersForNewHand(game);
+  newGame = rotateButton(newGame);
+  newGame = activateEligiblePlayersForHand(newGame);
 
   newGame = {
     ...newGame,
@@ -805,31 +745,14 @@ export function startNewHand(game: GameState): GameState {
     last_action: `Starting hand #${(game.hand_number || 0) + 1}`,
     showdown_summary: null,
     hasBigBlindActedThisStreet: false,
+    turn_deadline_at: null,
   };
-
-  newGame.players = newGame.players.map((p) => ({
-    ...p,
-    contributed_this_hand: 0,
-    bet_this_street: 0,
-    hole_cards: [],
-    live_hole_cards: [],
-    shredded_cards: [],
-    discard_submitted: false,
-    status: "active" as const,
-    current_pip_total: 0,
-    final_pip_total: null,
-    hand_result: null,
-  }));
 
   newGame = postBlinds(newGame);
   newGame = dealHoleCards(newGame);
+  newGame.current_player_seat = getFirstToAct(newGame, "preflop");
 
-  const bbSeat =
-    newGame.players.find((p) => p.bet_this_street === newGame.blinds.big)?.seat ??
-    newGame.button_seat;
-  newGame.current_player_seat = getNextActiveSeat(newGame, bbSeat);
-
-  return newGame;
+  return withTurnDeadline(newGame);
 }
 
 function hostUpdateStack(
@@ -923,6 +846,22 @@ export function transferHost(game: GameState, seat: number): GameState {
  * This is the single place that knows "what comes after what".
  */
 export function advanceToNextPhase(game: GameState): GameState {
+  if (countBettingPlayers(game) <= 1) {
+    const winner = game.players.find(
+      (p) =>
+        p.in_current_hand && (p.status === "active" || p.status === "all_in")
+    );
+    return awardPot({
+      ...game,
+      status: "showdown",
+      current_player_seat: null,
+      turn_deadline_at: null,
+      last_action: winner
+        ? `${winner.display_name} wins the pot`
+        : game.last_action,
+    });
+  }
+
   let newGame = { ...game };
 
   // Reset this street's betting state for ALL players
@@ -944,18 +883,18 @@ export function advanceToNextPhase(game: GameState): GameState {
   if (game.status === "preflop_betting" || game.status === "waiting") {
     newGame = dealFlop(newGame);
     newGame.status = "flop_betting" as GameStatus;
-    newGame.current_player_seat = getNextActiveSeat(newGame, newGame.button_seat);
+    newGame.current_player_seat = getFirstToAct(newGame, "postflop");
   } 
   else if (game.status === "flop_betting") {
     newGame = dealTurn(newGame);
     newGame.status = "turn_betting" as GameStatus;
-    newGame.current_player_seat = getNextActiveSeat(newGame, newGame.button_seat);
+    newGame.current_player_seat = getFirstToAct(newGame, "postflop");
   } 
   else if (game.status === "turn_betting") {
     newGame = dealRiver(newGame);
     newGame.status = "river_betting" as GameStatus;
-    newGame.current_player_seat = getNextActiveSeat(newGame, newGame.button_seat);
-  } 
+    newGame.current_player_seat = getFirstToAct(newGame, "postflop");
+  }
   else if (game.status === "river_betting") {
     newGame.status = "showdown" as GameStatus;
     newGame.current_player_seat = null;
@@ -965,19 +904,21 @@ export function advanceToNextPhase(game: GameState): GameState {
   }
 
   newGame.updated_at = now();
-  return newGame;
-}
-
-export function isHandLive(player: Player): boolean {
-  return player.status === "active" || player.status === "all_in";
-}
-
-export function isDeadHand(player: Player): boolean {
-  return player.live_hole_cards.length === 0 || player.status === "dead";
+  return withTurnDeadline(newGame);
 }
 
 function getBigBlindSeat(game: GameState): number {
+  if (isHeadsUpHand(game) || isHeadsUpTable(game)) {
+    return requireNextActorSeat(game, game.button_seat);
+  }
   const button = game.button_seat || 0;
   const sb = getNextActiveSeat(game, button);
-  return getNextActiveSeat(game, sb!)!;
+  if (sb == null) {
+    throw new GameApiError(
+      GameErrorCode.INVALID_STATE,
+      'Could not resolve the small blind seat.',
+      500
+    );
+  }
+  return requireNextActorSeat(game, sb);
 }

@@ -32,6 +32,7 @@ export function JoinSeatModal({
 }: JoinSeatModalProps) {
   const [name, setName] = useState(defaultName);
   const [stack, setStack] = useState(defaultStack);
+  const [formError, setFormError] = useState<string | null>(null);
 
   useEffect(() => {
     if (open) {
@@ -54,9 +55,16 @@ export function JoinSeatModal({
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = name.trim();
-    if (!trimmed) return;
+    if (!trimmed) {
+      setFormError('Enter a display name.');
+      return;
+    }
     const cents = dollarsToCents(stack);
-    if (cents === null || cents <= 0) return;
+    if (cents === null || cents <= 0) {
+      setFormError('Enter a valid starting stack greater than zero.');
+      return;
+    }
+    setFormError(null);
     onSubmit(trimmed, cents);
   };
 
@@ -88,7 +96,10 @@ export function JoinSeatModal({
             <input
               type="text"
               value={name}
-              onChange={(e) => setName(e.target.value)}
+              onChange={(e) => {
+                setName(e.target.value);
+                if (formError) setFormError(null);
+              }}
               autoFocus
               maxLength={24}
               placeholder="Your name at the table"
@@ -105,7 +116,10 @@ export function JoinSeatModal({
                 type="text"
                 inputMode="decimal"
                 value={stack}
-                onChange={(e) => setStack(e.target.value)}
+                onChange={(e) => {
+                  setStack(e.target.value);
+                  if (formError) setFormError(null);
+                }}
                 placeholder="100"
                 className="flex-1 bg-transparent px-3 py-2.5 text-white outline-none"
               />
@@ -113,9 +127,9 @@ export function JoinSeatModal({
             </div>
           </label>
 
-          {error && (
+          {(formError || error) && (
             <p className="text-red-400 text-sm bg-red-950/40 border border-red-900/50 rounded-lg px-3 py-2">
-              {error}
+              {formError || error}
             </p>
           )}
 

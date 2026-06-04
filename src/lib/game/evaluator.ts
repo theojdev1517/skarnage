@@ -1,5 +1,5 @@
-// src/lib/game/evaluator.ts
-import type { Card, Player } from '@/types/game';
+import type { Card } from '@/types/game';
+import { isValidCard } from '@/lib/game/cards';
 
 export type HandRank = 
   | "high_card" | "pair" | "two_pair" | "three_kind" 
@@ -151,7 +151,6 @@ function sortCardsDescending(cards: Card[]): Card[] {
 }
 
 function* combinations<T>(arr: T[], k: number): Generator<T[]> {
-  // ... (keep your existing combinations generator - it's fine)
   const n = arr.length;
   if (k > n || k === 0) return;
   const indices = Array.from({ length: k }, (_, i) => i);
@@ -229,7 +228,9 @@ function rankFiveCards(cards: Card[]): { rank: HandRank; score: number; cards: C
 }
 
 export function evaluateHighHand(holeCards: Card[], communityCards: Card[]): HandEvaluation {
-  const allCards = [...holeCards, ...communityCards].filter(Boolean) as Card[];
+  const allCards = [...holeCards, ...communityCards].filter(
+    (c): c is Card => Boolean(c) && isValidCard(c)
+  );
 
   if (allCards.length < 5) {
     return {
