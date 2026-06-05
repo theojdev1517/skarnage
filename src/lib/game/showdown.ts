@@ -13,7 +13,7 @@ export interface ShowdownResolution {
   uncontested: boolean;
 }
 
-function liveShowdownPlayers(game: GameState): Player[] {
+export function liveShowdownPlayers(game: GameState): Player[] {
   return game.players.filter(
     (p) =>
       p.in_current_hand &&
@@ -96,9 +96,14 @@ function pickLowestPips(players: Player[]): Player[] {
   return winners;
 }
 
-/** Sort winners by seat for deterministic remainder-chip assignment. */
+/** Sort winners by seat ascending for display / low-half remainder priority. */
 function bySeat(players: Player[]): Player[] {
   return [...players].sort((a, b) => a.seat - b.seat);
+}
+
+/** Reverse seat order so higher seat numbers get remainder cents first (used for high-half ties = "worst position"). */
+function byReverseSeat(players: Player[]): Player[] {
+  return [...players].sort((a, b) => b.seat - a.seat);
 }
 
 /**
@@ -107,13 +112,15 @@ function bySeat(players: Player[]): Player[] {
  * - Dead high hands (score 0) cannot win the high half.
  * - If no one qualifies for high, the high half goes to low winner(s).
  */
-export function resolveShowdown(game: GameState): ShowdownResolution {
-  assertPotMatchesContributions(game);
-
-  const totalPot = game.pot;
-  const players = liveShowdownPlayers(game);
+export function resolveShowdown(game: GameState, overridePlayers?: Player[], overridePot?: number): ShowdownResolution {
+  const totalPot = overridePot ?? game.pot;
+  const players = overridePlayers ?? liveShowdownPlayers(game);
   const evaluations = new Map<string, HandEvaluation>();
   const community = boardCards(game);
+
+  if (!overridePlayers) {
+    assertPotMatchesContributions(game);
+  }
 
   if (players.length === 0) {
     return {
@@ -166,7 +173,9 @@ export function resolveShowdown(game: GameState): ShowdownResolution {
     highWinners = lowWinners;
   }
 
-  const highPotShare = Math.floor(totalPot / 2);
+  // Per house rules: odd chip (if any) goes to the high half.
+  // Within a high-half tie, extras go to "worst position" (we use reverse seat order).
+  const highPotShare = Math.ceil(totalPot / 2);
   const lowPotShare = totalPot - highPotShare;
 
   return {
@@ -179,7 +188,13 @@ export function resolveShowdown(game: GameState): ShowdownResolution {
   };
 }
 
-/** Split a share among winners; leftover cents go to earliest seat(s). */
+/**
+ * Split a share among winners; leftover cents assigned in the *order of the winners array*
+ * (first player in the passed list receives the first extra cent, etc.).
+ * Callers control priority:
+ *  - For high half: pass byReverseSeat(...) so "worst position" (higher seat) gets extras.
+ *  - For low half: pass bySeat(...) (earliest seat).
+ */
 export function splitShare(
   shareCents: number,
   winners: Player[]
@@ -189,9 +204,8 @@ export function splitShare(
 
   const base = Math.floor(shareCents / winners.length);
   let remainder = shareCents - base * winners.length;
-  const ordered = bySeat(winners);
 
-  for (const w of ordered) {
+  for (const w of winners) {
     let amount = base;
     if (remainder > 0) {
       amount += 1;
@@ -211,8 +225,9 @@ export function buildPayouts(resolution: ShowdownResolution): Map<string, number
     }
   };
 
-  merge(splitShare(resolution.highPotShare, resolution.highWinners));
-  merge(splitShare(resolution.lowPotShare, resolution.lowWinners));
+  // High: reverse seat for remainder priority (worst position first per rules)
+  merge(splitShare(resolution.highPotShare, byReverseSeat(resolution.highWinners)));
+  merge(splitShare(resolution.lowPotShare, bySeat(resolution.lowWinners)));
 
   return totals;
 }
@@ -232,11 +247,11 @@ export function assertPayoutsCoverPot(
 }
 
 export function buildShowdownSummary(
-  resolution: ShowdownResolution,
-  payouts: Map<string, number>
+  resolution: ShowdownResolution
 ): ShowdownSummary {
-  const highPer = splitShare(resolution.highPotShare, resolution.highWinners);
-  const lowPer = splitShare(resolution.lowPotShare, resolution.lowWinners);
+  // Use same remainder priority as buildPayouts for consistency in summary amounts
+  const highPer = splitShare(resolution.highPotShare, byReverseSeat(resolution.highWinners));
+  const lowPer = splitShare(resolution.lowPotShare, bySeat(resolution.lowWinners));
 
   return {
     high_winners: resolution.highWinners.map((p) => ({

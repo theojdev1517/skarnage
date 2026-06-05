@@ -32,11 +32,15 @@ export function messageFromGameApi(
   data: GameApiErrorPayload,
   fallback = 'That action is not allowed right now.'
 ): string {
-  if (data.code && data.code in CODE_MESSAGES) {
-    return CODE_MESSAGES[data.code as GameErrorCode] ?? data.error ?? fallback;
-  }
+  // Prefer the specific error message from server (e.g. "That seat already has a pending request.")
+  // even for generic codes like INVALID_REQUEST. The map is only fallback.
   if (data.error) {
-    return toUserFacingMessage(new Error(data.error), fallback);
+    const fromErr = toUserFacingMessage(new Error(data.error), fallback);
+    if (fromErr !== fallback) return fromErr;
+    return data.error; // surface the exact server message
+  }
+  if (data.code && data.code in CODE_MESSAGES) {
+    return CODE_MESSAGES[data.code as GameErrorCode] ?? fallback;
   }
   return fallback;
 }
@@ -68,6 +72,7 @@ const USER_FACING = [
   /^betting is only/i,
   /^host stack edits/i,
   /^join request/i,
+  /seat.*pending|pending.*request|already have a pending/i,
   /^someone else updated/i,
   /^could not /i,
   /^table /i,

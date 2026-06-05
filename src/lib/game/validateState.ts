@@ -4,16 +4,9 @@ import { normalizeGameState } from '@/lib/game/playerLifecycle';
 
 const VALID_STATUSES: GameStatus[] = [
   'waiting',
-  'buying_in',
   'preflop_betting',
-  'flop_dealt',
-  'flop_discard',
   'flop_betting',
-  'turn_dealt',
-  'turn_discard',
   'turn_betting',
-  'river_dealt',
-  'river_discard',
   'river_betting',
   'showdown',
   'finished',

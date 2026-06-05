@@ -3,7 +3,7 @@ pid: 7116
 cwd: "C:\Users\theoj\OneDrive\Documents\Coding\skarnage"
 command: "Set-Location \"C:\\Users\\theoj\\OneDrive\\Documents\\Coding\\skarnage\"; npm run dev"
 started_at: 2026-06-04T18:16:56.138Z
-running_for_ms: 32410012 
+running_for_ms: 32475011 
 ---
 
 > skarnage@0.1.0 dev

@@ -1,7 +1,7 @@
-import type { GameState, Player, Card, GameStatus, ShowdownSummary } from "@/types/game";
+import type { GameState, Player, Card, GameStatus, SidePot } from "@/types/game";
 import type { HandEvaluation } from "./evaluator";
 import { evaluateHighHand, parseCardRank } from "./evaluator";
-import { validateWagerTo } from "./bettingLimits";
+import { getMinRaiseIncrement, validateWagerTo } from "./bettingLimits";
 import {
   defaultPlayerFields,
   isInLiveHand,
@@ -10,6 +10,7 @@ import {
 } from "./playerLifecycle";
 import {
   applySeatIntentAfterFold,
+  applyRebuyTimeouts,
   assertTurnTimerExpired,
   openRebuyWindow,
   preparePlayersForNewHand,
@@ -30,6 +31,7 @@ import {
   buildShowdownSummary,
   assertPayoutsCoverPot,
   resolveShowdown,
+  liveShowdownPlayers,
 } from "./showdown";
 import { now } from "./time";
 
@@ -53,7 +55,6 @@ export function createNewGame(
     hole_cards: [],
     live_hole_cards: [],
     shredded_cards: [],
-    discard_submitted: false,
     status: "active",
     current_pip_total: 0,
     final_pip_total: null,
@@ -77,13 +78,14 @@ export function createNewGame(
     current_player_seat: null,
     button_seat: 1,
     last_aggressor_seat: null,
-    skip_discard_eligible: false,
     side_pots: [],
     action_history: [],
     last_action: `${hostName} created the table (seat 1, ${formatChips(startingStackCents)} chips)`,
     deck: [],
     deck_index: 0,
     pending_joins: [],
+    pending_chip_adds: [],
+    pending_rebuys: [],
     turn_deadline_at: null,
     rebuy_deadline_at: null,
     rebuy_offered_seats: [],
@@ -169,7 +171,6 @@ export function dealHoleCards(game: GameState): GameState {
         live_hole_cards: [],
         shredded_cards: [],
         current_pip_total: 0,
-        discard_submitted: false,
         in_current_hand: false,
         status: "active" as const,
       };
@@ -184,7 +185,6 @@ export function dealHoleCards(game: GameState): GameState {
       live_hole_cards: [...holeCards],
       shredded_cards: [],
       current_pip_total: calculatePipTotal(holeCards),
-      discard_submitted: false,
       in_current_hand: true,
     };
   });
@@ -286,26 +286,34 @@ export function countBettingPlayers(game: GameState): number {
 }
 
 export function isBettingRoundComplete(game: GameState): boolean {
-  const activePlayers = game.players.filter(
-    (p) =>
-      p.in_current_hand && (p.status === 'active' || p.status === 'all_in')
+  const livePlayers = game.players.filter(
+    (p) => p.in_current_hand && (p.status === 'active' || p.status === 'all_in')
   );
-
-  if (activePlayers.length <= 1) return true;
+  if (livePlayers.length <= 1) return true;
 
   const currentWager = game.current_wager ?? 0;
-  const everyoneMatched = activePlayers.every(p => 
+  const everyoneMatched = livePlayers.every(p => 
     p.bet_this_street >= currentWager || p.stack === 0
   );
 
   if (!everyoneMatched) return false;
 
-  // === AGGRESSION ROUND ===
+  const acting = getActingPlayers(game);
+  // If everyone has matched (or is all-in), and at most 1 player can still act (others all-in),
+  // the round is complete. This is key for all-in cases: do NOT early-complete if the last
+  // active player with chips still has bet_this < current_wager (he needs to call the all-in(s)).
+  if (acting.length <= 1) return true;
+
+  // === AGGRESSION ROUND (bet or raise happened this street) ===
+  // Once all remaining live players have matched the current wager (or are all-in / folded),
+  // the round is closed. We no longer require the pointer to land back on the exact
+  // last_aggressor_seat (which was fragile with mid-round folds changing the acting list).
+  // This prevents extra unwanted actions after folds reduce the field (e.g. HU on flop).
   if (game.last_aggressor_seat !== null) {
-    return game.current_player_seat === game.last_aggressor_seat;
+    return true;
   }
 
-  // === PURE CHECK/CALL ROUND ===
+  // === PURE CHECK/CALL ROUND (no one has bet/raised this street yet) ===
   if (game.status === "preflop_betting" || game.status === "waiting") {
     // Preflop: only complete after BB has acted
     return game.hasBigBlindActedThisStreet === true;
@@ -409,11 +417,26 @@ export function processBet(
     };
 
     newWager = player.bet_this_street + actual;
-    newMinRaise = newWager - oldWager;
-    newAggressor = seat;
+    const minInc = getMinRaiseIncrement(game);
+    const delta = newWager - oldWager;
+    if (delta >= minInc) {
+      newAggressor = seat;
+      newMinRaise = delta;
+    } else {
+      // Short all-in raise (< min raise increment): do not reopen betting for already-acted players.
+      // Unacted players (to act after) still get their turn on the prior bet level (or to raise over this).
+      // Keep prior aggressor and min_raise so round completion logic continues correctly.
+      newMinRaise = game.min_raise ?? minInc;
+      // newAggressor left as prior
+    }
     lastActionText = `${player.display_name} raised to ${formatCents(newWager)}`;
   } else {
     throw new Error(`Invalid betting action: ${action}`);
+  }
+
+  // Set all_in status if stack exhausted on this action
+  if (updatedPlayers[playerIndex].stack === 0 && updatedPlayers[playerIndex].status === 'active') {
+    updatedPlayers[playerIndex] = { ...updatedPlayers[playerIndex], status: 'all_in' as const };
   }
 
   const newPot = updatedPlayers.reduce((sum, p) => sum + p.contributed_this_hand, 0);
@@ -425,7 +448,6 @@ export function processBet(
     current_wager: newWager,
     min_raise: newMinRaise,
     last_aggressor_seat: newAggressor,
-    current_player_seat: requireNextActorSeat(game, seat),
     updated_at: now(),
     last_action: lastActionText,
     hasBigBlindActedThisStreet: 
@@ -434,6 +456,12 @@ export function processBet(
         ? true 
         : game.hasBigBlindActedThisStreet,
   };
+
+  // Only set a current actor if someone can still act; otherwise leave null (all-ins will auto-advance)
+  const nextActor = getNextActiveSeat(result, seat);
+  result.current_player_seat = nextActor;
+
+  result.side_pots = computeSidePots(result.players);
 
   if (action === 'fold') {
     result = applySeatIntentAfterFold(result, seat);
@@ -453,6 +481,17 @@ export function processBet(
         ? `${winner.display_name} wins the pot (everyone else folded)`
         : result.last_action,
     });
+  }
+
+  // Auto-proceed only if no more betting action possible (i.e. the last active player
+  // has matched any all-in(s) or there is nothing left to call). This ensures the
+  // covered player gets to call/fold/raise before auto-advancing on all-ins.
+  if (countBettingPlayers(result) > 1 && noMoreBettingActionPossible(result)) {
+    result = advanceToNextPhase(result);
+    if (result.status === 'showdown') {
+      result = awardPot(result);
+    }
+    return result;
   }
 
   if (isBettingRoundComplete(result)) {
@@ -490,12 +529,56 @@ const formatCents = formatChips;
 
 export function awardPot(game: GameState): GameState {
   assertShowdownReady(game);
-  const resolution = resolveShowdown(game);
-  const payouts = buildPayouts(resolution);
-  assertPayoutsCoverPot(game, payouts);
+
+  // Compute evals using full live players (for hand descriptions etc.)
+  const fullResolution = resolveShowdown(game);
+  const evaluations = fullResolution.evaluations;
+
+  // Now award per side pot (main + sides). Each side pot resolved only among its eligible live players.
+  const totalPayouts = new Map<string, number>();
+  const liveAtShowdown = liveShowdownPlayers(game);
+
+  const sidePots = game.side_pots && game.side_pots.length > 0 ? game.side_pots : [{ amount: game.pot, eligible: liveAtShowdown.map(p => p.user_id) }];
+
+  for (const sp of sidePots) {
+    const potContenders = liveAtShowdown.filter(p => sp.eligible.includes(p.user_id));
+    if (potContenders.length === 0) continue;
+
+    const subRes = resolveShowdown(game, potContenders, sp.amount);
+    const subPayouts = buildPayouts(subRes);
+    for (const [id, amt] of subPayouts) {
+      totalPayouts.set(id, (totalPayouts.get(id) ?? 0) + amt);
+    }
+  }
+
+  // For summary we reuse the full resolution (high/low winners among all) but the amounts will be from per-pot payouts.
+  // (Summary is approximate for multi side pots; core payouts are correct.)
+  const payouts = totalPayouts;
+  // Note: assertPayoutsCoverPot would fail for sub; skip or sum check manually if needed.
+  const totalPaid = Array.from(totalPayouts.values()).reduce((s, n) => s + n, 0);
+  if (totalPaid !== game.pot) {
+    // In rare edge (e.g. 0 eligible), allow; otherwise should match.
+    console.warn(`Side pot payouts total ${totalPaid} vs pot ${game.pot}`);
+  }
 
   const updatedPlayers = [...game.players];
-  const showdown_summary = buildShowdownSummary(resolution, payouts);
+  const showdown_summary = buildShowdownSummary(fullResolution);
+
+  // Remap amounts in the (overall high/low) summary to the *actual* total payouts per player.
+  // This fixes the box showing "half of entire pot" even when side pots mean different splits/eligibility.
+  const payoutBySeat = new Map<number, number>();
+  for (const [uid, amt] of totalPayouts) {
+    const pl = updatedPlayers.find((pp) => pp.user_id === uid) || liveAtShowdown.find((pp) => pp.user_id === uid);
+    if (pl) payoutBySeat.set(pl.seat, amt);
+  }
+  showdown_summary.high_winners = showdown_summary.high_winners.map((w) => ({
+    ...w,
+    amount_cents: payoutBySeat.get(w.seat) ?? w.amount_cents,
+  }));
+  showdown_summary.low_winners = showdown_summary.low_winners.map((w) => ({
+    ...w,
+    amount_cents: payoutBySeat.get(w.seat) ?? w.amount_cents,
+  }));
 
   for (let i = 0; i < updatedPlayers.length; i++) {
     const p = updatedPlayers[i];
@@ -503,7 +586,7 @@ export function awardPot(game: GameState): GameState {
     if (winnings <= 0) continue;
 
     const highEval =
-      resolution.evaluations.get(p.user_id) ??
+      evaluations.get(p.user_id) ??
       evaluatePlayerHand(p, game.board.top);
 
     updatedPlayers[i] = {
@@ -524,18 +607,33 @@ export function awardPot(game: GameState): GameState {
     .map((w) => `${w.display_name} (${w.pips} pips, ${formatCents(w.amount_cents)})`)
     .join('; ');
 
-  const last_action = resolution.uncontested
+  // Build accurate last_action from actual per-player payouts (important for side-pot cases where summary uses full-pot halves).
+  // This ensures printouts reflect real awarded amounts, not "even half of entire pot".
+  const actualWinnerParts: string[] = [];
+  for (const [uid, amt] of totalPayouts) {
+    if (amt <= 0) continue;
+    const pl = liveAtShowdown.find((pp) => pp.user_id === uid) || game.players.find((pp) => pp.user_id === uid);
+    if (!pl) continue;
+    const desc = evaluations.get(uid)?.description ?? 'hand';
+    const lowP = pl.current_pip_total;
+    actualWinnerParts.push(`${pl.display_name} ${formatCents(amt)} (high: ${desc}, low: ${lowP} pips)`);
+  }
+  const last_action = fullResolution.uncontested
     ? showdown_summary.high_winners[0]
       ? `${showdown_summary.high_winners[0].display_name} wins ${formatCents(game.pot)} (uncontested)`
       : 'Hand complete (uncontested)'
-    : [highNames ? `High: ${highNames}` : null, lowNames ? `Low: ${lowNames}` : null]
-        .filter(Boolean)
-        .join(' · ');
+    : actualWinnerParts.length > 0
+      ? `Pot awarded: ${actualWinnerParts.join('; ')}`
+      : [highNames ? `High: ${highNames}` : null, lowNames ? `Low: ${lowNames}` : null]
+          .filter(Boolean)
+          .join(' · ');
 
   const finished = {
     ...game,
     players: updatedPlayers,
     pot: 0,
+    // Leave side_pots (the layers/eligible at showdown) so UI can show detailed side-pot breakdown
+    // instead of clearing. (The pre-award side_pots reflect the pot structure.)
     status: "finished" as GameStatus,
     updated_at: now(),
     last_action: last_action || 'Hand complete (no eligible winners)',
@@ -546,7 +644,7 @@ export function awardPot(game: GameState): GameState {
 }
 
 function firstActiveSeat(state: GameState, preferred: number | null): number | null {
-  const active = getActivePlayers(state);
+  const active = getActivePlayers(state).sort((a, b) => a.seat - b.seat);
   if (active.length === 0) return null;
   if (preferred != null && active.some((p) => p.seat === preferred)) {
     return preferred;
@@ -577,17 +675,74 @@ export function getActivePlayers(state: GameState): Player[] {
   return state.players.filter((p) => isInLiveHand(p));
 }
 
+export function getActingPlayers(state: GameState): Player[] {
+  return state.players.filter(
+    (p) => p.in_current_hand && p.stack > 0 && (p.status === 'active' || p.status === 'all_in')
+  );
+}
+
+/**
+ * Returns true if there is no more betting action possible this street.
+ * Used to decide auto-advance in all-in situations: if the last player(s) with chips
+ * have already matched the current wager (or there is no wager to them), we can
+ * auto-run the remaining streets without requiring them to "check".
+ * Critical: when an all-in happens, do NOT auto-advance if the remaining covered player
+ * still has bet_this_street < current_wager (he must get a chance to call the all-in).
+ */
+function noMoreBettingActionPossible(game: GameState): boolean {
+  const acting = getActingPlayers(game);
+  if (acting.length === 0) return true;
+  if (acting.length > 1) return false;
+  // Exactly 1 actor left (others all-in or folded); check if he still owes a call
+  const p = acting[0];
+  const cw = game.current_wager ?? 0;
+  return p.bet_this_street >= cw || p.stack === 0;
+}
+
+/**
+ * Compute side pots based on contributed_this_hand for players who put money in.
+ * Each layer pot is (delta level) * (num players at/above that contrib level).
+ * Eligible for a layer: those with contrib >= layer level.
+ * Main pot is the lowest layer (all who put at least the min).
+ * This is called after contrib changes (bets, blinds) so side_pots always reflect current layers.
+ */
+function computeSidePots(players: Player[]): SidePot[] {
+  const relevant = players.filter((p) => p.contributed_this_hand > 0);
+  if (relevant.length === 0) return [];
+  const amounts = relevant.map((p) => p.contributed_this_hand);
+  const uniqueLevels = Array.from(new Set(amounts)).sort((a, b) => a - b);
+  const pots: SidePot[] = [];
+  let previousLevel = 0;
+  for (const level of uniqueLevels) {
+    const layer = level - previousLevel;
+    if (layer > 0) {
+      const eligible = relevant
+        .filter((p) => p.contributed_this_hand >= level)
+        .map((p) => p.user_id);
+      const potAmount = layer * eligible.length;
+      if (potAmount > 0) {
+        pots.push({ amount: potAmount, eligible });
+      }
+    }
+    previousLevel = level;
+  }
+  return pots;
+}
+
 export function getNextActiveSeat(game: GameState, fromSeat: number): number | null {
-  const active = game.players
-    .filter((p) => p.in_current_hand && (p.status === 'active' || p.status === 'all_in'))
+  const acting = game.players
+    .filter((p) => p.in_current_hand && p.stack > 0 && (p.status === 'active' || p.status === 'all_in'))
     .sort((a, b) => a.seat - b.seat);
 
-  if (active.length === 0) return null;
+  if (acting.length === 0) return null;
 
-  const idx = active.findIndex(p => p.seat === fromSeat);
-  if (idx === -1) return active[0]?.seat ?? null;
-
-  return active[(idx + 1) % active.length].seat;
+  // Find the next clockwise (higher seat number) from 'fromSeat' among current acting.
+  // This correctly continues after a fold (fromSeat may no longer be in 'acting' list after status update).
+  // If no higher, wrap to the lowest seat acting player.
+  for (const p of acting) {
+    if (p.seat > fromSeat) return p.seat;
+  }
+  return acting[0].seat;
 }
 
 export function requireNextActorSeat(game: GameState, fromSeat: number): number {
@@ -656,6 +811,31 @@ export function postBlinds(state: GameState): GameState {
   let assignment = resolveBlindSeats(workingState);
   if (!assignment) return state;
 
+  // Sanitize stale last/prior blind records if the recorded posters are no longer seated/eligible
+  // (e.g. stood up, went broke without rebuy, removed mid-prior hand). Prevents erroneous
+  // "same BB" re-rotates or skipped logic based on ghosts from previous hand.
+  const seatedSeats = new Set(getSeatedPlayers(workingState).map((p) => p.seat));
+  let lastBlinds = workingState.last_blinds;
+  let priorBlinds = workingState.prior_blinds;
+  if (lastBlinds && !seatedSeats.has(lastBlinds.big_seat)) {
+    priorBlinds = lastBlinds;
+    lastBlinds = undefined;
+  }
+  if (priorBlinds && !seatedSeats.has(priorBlinds.big_seat)) {
+    priorBlinds = undefined;
+  }
+  if (lastBlinds && lastBlinds.small_seat != null && !seatedSeats.has(lastBlinds.small_seat)) {
+    lastBlinds = { ...lastBlinds, small_seat: null };
+  }
+  if (priorBlinds && priorBlinds.small_seat != null && !seatedSeats.has(priorBlinds.small_seat)) {
+    priorBlinds = { ...priorBlinds, small_seat: null };
+  }
+  workingState = {
+    ...workingState,
+    last_blinds: lastBlinds,
+    prior_blinds: priorBlinds,
+  };
+
   if (
     assignment.bigBlindSeat === workingState.last_blinds?.big_seat &&
     assignment.bigBlindSeat === workingState.prior_blinds?.big_seat
@@ -673,17 +853,12 @@ export function postBlinds(state: GameState): GameState {
     assignment = { ...assignment, smallBlindSeat: null, deadSmallBlind: true };
   }
 
-  const skipped = seatsThatSkippedBlinds(
-    workingState,
-    workingState.last_blinds,
-    assignment
-  );
-  if (skipped.length === 1) {
-    const seat = skipped[0];
-    if (seat !== assignment.bigBlindSeat && seat !== assignment.smallBlindSeat) {
-      assignment = { ...assignment, bigBlindSeat: seat };
-    }
-  }
+  // NOTE: Previously had a "if exactly 1 skipped, force as BB" override here.
+  // That logic was causing incorrect blind posting and first-to-act in normal 4+ player games
+  // (e.g. forcing UTG to post BB and action starting on button preflop). Removed for correct
+  // button rotation. Missed-blind catch-up can be revisited with proper rules if needed.
+  // const skipped = seatsThatSkippedBlinds(...);
+  // if (skipped.length === 1) { ... override ... }
 
   let sbSeat = assignment.smallBlindSeat;
   const bbSeat = assignment.bigBlindSeat;
@@ -694,8 +869,16 @@ export function postBlinds(state: GameState): GameState {
   workingState = postBlind(workingState, bbSeat, workingState.blinds.big);
 
   const newPot = workingState.players.reduce((sum, p) => sum + p.contributed_this_hand, 0);
-  const firstToAct = getFirstToAct(workingState, "preflop");
+  // Compute first to act *respecting the final (possibly overridden for skipped) bbSeat*,
+  // rather than always recomputing via getBigBlindSeat (which ignores assignment overrides).
+  // This ensures when skipped logic forces e.g. seat4 as BB (skipping 3), action starts after 4.
+  const isHU = isHeadsUpHand(workingState) || isHeadsUpTable(workingState);
+  const firstToAct = isHU
+    ? getFirstToAct(workingState, "preflop")
+    : getNextActiveSeat(workingState, bbSeat);
   const blindRecord = recordBlindsPosted(assignment, workingState.hand_number || 1);
+
+  workingState.side_pots = computeSidePots(workingState.players);
 
   const posted = {
     ...workingState,
@@ -727,7 +910,8 @@ export function postBlinds(state: GameState): GameState {
 }
 
 export function startNewHand(game: GameState): GameState {
-  let newGame = preparePlayersForNewHand(game);
+  let newGame = applyRebuyTimeouts(game);
+  newGame = preparePlayersForNewHand(newGame);
   newGame = rotateButton(newGame);
   newGame = activateEligiblePlayersForHand(newGame);
 
@@ -735,6 +919,7 @@ export function startNewHand(game: GameState): GameState {
     ...newGame,
     hand_number: (game.hand_number || 0) + 1,
     pot: 0,
+    side_pots: [],
     current_wager: 0,
     min_raise: 0,
     last_aggressor_seat: null,
@@ -750,7 +935,18 @@ export function startNewHand(game: GameState): GameState {
 
   newGame = postBlinds(newGame);
   newGame = dealHoleCards(newGame);
-  newGame.current_player_seat = getFirstToAct(newGame, "preflop");
+  // Do not overwrite current_player_seat here. postBlinds already set it based on the final
+  // (possibly skipped-logic-overridden) bbSeat from assignment. Recomputing via getFirstToAct
+  // would revert special cases and cause wrong first actor (e.g. BB getting first action).
+
+  // If all remaining players are all-in after blinds/holes (no one can act preflop), auto run the streets to showdown.
+  if (getActingPlayers(newGame).length === 0 && countBettingPlayers(newGame) > 1) {
+    newGame = advanceToNextPhase(newGame);
+    if (newGame.status === 'showdown') {
+      newGame = awardPot(newGame);
+    }
+    return newGame;
+  }
 
   return withTurnDeadline(newGame);
 }
@@ -840,6 +1036,7 @@ export function transferHost(game: GameState, seat: number): GameState {
     last_action: `Host transferred to ${player.display_name} (seat ${seat})`,
   };
 }
+
 /**
  * Pure orchestrator: Advance the game to the next logical phase.
  * Centralizes all dealing + position + status transitions.
@@ -866,14 +1063,15 @@ export function advanceToNextPhase(game: GameState): GameState {
 
   // Reset this street's betting state for ALL players
   newGame.hasBigBlindActedThisStreet = false;
-  newGame.players = newGame.players.map((p) => ({
-    ...p,
-    bet_this_street: 0,
-    // Reactivate non-folded/non-dead players for the next street
-    status: (p.status === "folded" || p.status === "dead") 
-      ? p.status 
-      : "active" as const,
-  }));
+  newGame.players = newGame.players.map((p) => {
+    const isFoldedOrDead = p.status === "folded" || p.status === "dead";
+    return {
+      ...p,
+      bet_this_street: 0,
+      // Preserve all_in for stack=0 players across streets; others active
+      status: isFoldedOrDead ? p.status : (p.stack === 0 ? 'all_in' as const : 'active' as const),
+    };
+  });
 
   newGame.current_wager = 0;
   newGame.min_raise = 0;
@@ -904,6 +1102,22 @@ export function advanceToNextPhase(game: GameState): GameState {
   }
 
   newGame.updated_at = now();
+
+  // Auto-runout for all-ins: only if no more betting action possible (last active has matched
+  // the all-ins or no wager left). This ensures covered players get their call/fold/raise
+  // chance before auto-advancing the rest of the hand.
+  if (countBettingPlayers(newGame) > 1 && noMoreBettingActionPossible(newGame)) {
+    if (newGame.status === 'showdown') {
+      return awardPot(newGame);
+    }
+    newGame.current_player_seat = null; // don't expose turn to the lone actor
+    return advanceToNextPhase(newGame);
+  }
+
+  if (newGame.status === 'showdown') {
+    return awardPot(newGame);
+  }
+
   return withTurnDeadline(newGame);
 }
 

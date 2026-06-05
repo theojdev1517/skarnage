@@ -3,14 +3,8 @@ import { GAME_CONFIG } from '@/lib/game/config';
 
 export const HAND_IN_PROGRESS_STATUSES: GameStatus[] = [
   'preflop_betting',
-  'flop_dealt',
-  'flop_discard',
   'flop_betting',
-  'turn_dealt',
-  'turn_discard',
   'turn_betting',
-  'river_dealt',
-  'river_discard',
   'river_betting',
   'showdown',
 ];
@@ -52,6 +46,8 @@ export function normalizeGameState(game: GameState): GameState {
   return {
     ...game,
     pending_joins: game.pending_joins ?? [],
+    pending_chip_adds: game.pending_chip_adds ?? [],
+    pending_rebuys: game.pending_rebuys ?? [],
     turn_deadline_at: game.turn_deadline_at ?? null,
     rebuy_deadline_at: game.rebuy_deadline_at ?? null,
     rebuy_offered_seats: game.rebuy_offered_seats ?? [],

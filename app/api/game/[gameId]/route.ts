@@ -18,6 +18,15 @@ import {
   playerRebuy,
   requestSetAway,
   requestStandUp,
+  hostForceAway,
+  hostRemovePlayer,
+  applyRebuyTimeouts,
+  requestAddChips,
+  approveAddChips,
+  denyAddChips,
+  requestRebuy,
+  approveRebuy,
+  denyRebuy,
 } from '@/lib/game/seatManagement';
 import { saveGameState } from '@/lib/game/persistGame';
 import {
@@ -105,7 +114,9 @@ export async function POST(
     const loaded = await loadGame(supabase, gameId);
     if (loaded instanceof NextResponse) return loaded;
 
-    const { game, version } = loaded;
+    const { game: loadedGame, version } = loaded;
+    // Apply any expired rebuy timeouts (sets broke non-rebuyers to away after 10s window)
+    const game = applyRebuyTimeouts(loadedGame);
     let result: GameState;
     let hostIdUpdate: string | undefined;
 
@@ -213,6 +224,60 @@ export async function POST(
         break;
       }
 
+      case 'requestAddChips': {
+        assertPhaseAllows(game, 'requestAddChips');
+        const amountCents = parseCents(body.amountCents, 'Add chips amount');
+        result = requestAddChips(game, user.id, amountCents);
+        break;
+      }
+
+      case 'approveAddChips': {
+        requireHost(game, user.id);
+        assertPhaseAllows(game, 'approveAddChips');
+        if (typeof body.requestId !== 'string') {
+          throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'requestId required.', 400);
+        }
+        result = approveAddChips(game, user.id, body.requestId);
+        break;
+      }
+
+      case 'denyAddChips': {
+        requireHost(game, user.id);
+        assertPhaseAllows(game, 'denyAddChips');
+        if (typeof body.requestId !== 'string') {
+          throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'requestId required.', 400);
+        }
+        result = denyAddChips(game, user.id, body.requestId);
+        break;
+      }
+
+      case 'requestRebuy': {
+        assertPhaseAllows(game, 'requestRebuy');
+        const stackCents = parseCents(body.startingStackCents, 'Rebuy stack');
+        result = requestRebuy(game, user.id, stackCents);
+        break;
+      }
+
+      case 'approveRebuy': {
+        requireHost(game, user.id);
+        assertPhaseAllows(game, 'approveRebuy');
+        if (typeof body.requestId !== 'string') {
+          throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'requestId required.', 400);
+        }
+        result = approveRebuy(game, user.id, body.requestId);
+        break;
+      }
+
+      case 'denyRebuy': {
+        requireHost(game, user.id);
+        assertPhaseAllows(game, 'denyRebuy');
+        if (typeof body.requestId !== 'string') {
+          throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'requestId required.', 400);
+        }
+        result = denyRebuy(game, user.id, body.requestId);
+        break;
+      }
+
       case 'turnTimeout': {
         assertPhaseAllows(game, 'turnTimeout');
         const seat = parseSeat(body.seat);
@@ -254,6 +319,22 @@ export async function POST(
         const seat = parseSeat(body.seat);
         result = engine.transferHost(game, seat);
         hostIdUpdate = result.host_id;
+        break;
+      }
+
+      case 'hostForceAway': {
+        requireHost(game, user.id);
+        assertPhaseAllows(game, 'hostForceAway');
+        const seat = parseSeat(body.seat);
+        result = hostForceAway(game, user.id, seat);
+        break;
+      }
+
+      case 'hostRemovePlayer': {
+        requireHost(game, user.id);
+        assertPhaseAllows(game, 'hostRemovePlayer');
+        const seat = parseSeat(body.seat);
+        result = hostRemovePlayer(game, user.id, seat);
         break;
       }
 

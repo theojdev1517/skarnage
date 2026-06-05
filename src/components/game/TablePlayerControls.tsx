@@ -25,12 +25,18 @@ export function TablePlayerControls({
     <div className="flex flex-wrap gap-2 shrink-0">
       <button
         type="button"
-        disabled={busy || isAway}
+        disabled={busy}
         onClick={onSetAway}
         className="px-3 py-1.5 rounded text-xs border border-zinc-600 hover:bg-zinc-800 disabled:opacity-50"
-        title={pendingAway ? 'Will sit out after your actions this hand' : 'Sit out next hands'}
+        title={
+          isAway
+            ? 'Return to the table for future hands'
+            : pendingAway
+            ? 'Will sit out after your actions this hand'
+            : 'Sit out next hands'
+        }
       >
-        {pendingAway ? 'Away (pending)' : isAway ? 'Away' : 'Sit out'}
+        {isAway ? 'Back' : pendingAway ? 'Away (pending)' : 'Sit out'}
       </button>
       <button
         type="button"

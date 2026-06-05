@@ -106,7 +106,6 @@ export function approveJoin(
     hole_cards: [],
     live_hole_cards: [],
     shredded_cards: [],
-    discard_submitted: false,
     status: 'active',
     current_pip_total: 0,
     final_pip_total: null,
@@ -153,6 +152,57 @@ export function denyJoin(game: GameState, hostUserId: string, requestId: string)
   };
 }
 
+/** Host-only: force a seated player to be marked away (immediate). */
+export function hostForceAway(game: GameState, hostUserId: string, targetSeat: number): GameState {
+  const g = normalizeGameState(game);
+  if (hostUserId !== g.host_id) {
+    throw new GameApiError(GameErrorCode.HOST_ONLY, 'Host only.', 403);
+  }
+
+  const player = g.players.find((p) => p.seat === targetSeat);
+  if (!player) {
+    throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'No player in that seat.', 404);
+  }
+
+  if (player.presence === 'away') {
+    return g;
+  }
+
+  return {
+    ...g,
+    players: g.players.map((p) =>
+      p.seat === targetSeat
+        ? { ...p, presence: 'away' as const, seat_intent: 'none' as const, in_current_hand: false }
+        : p
+    ),
+    updated_at: now(),
+    last_action: `Host set ${player.display_name} (seat ${targetSeat}) away`,
+  };
+}
+
+/** Host-only: immediately remove a player from their seat (kick). Cannot remove the current host. */
+export function hostRemovePlayer(game: GameState, hostUserId: string, targetSeat: number): GameState {
+  const g = normalizeGameState(game);
+  if (hostUserId !== g.host_id) {
+    throw new GameApiError(GameErrorCode.HOST_ONLY, 'Host only.', 403);
+  }
+
+  const player = g.players.find((p) => p.seat === targetSeat);
+  if (!player) {
+    throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'No player in that seat.', 404);
+  }
+
+  if (player.user_id === g.host_id) {
+    throw new GameApiError(
+      GameErrorCode.INVALID_REQUEST,
+      'Transfer host to another player before removing the host from their seat.',
+      409
+    );
+  }
+
+  return removePlayerFromSeat(g, player.user_id, `Host removed ${player.display_name} from seat ${targetSeat}`);
+}
+
 export function requestSetAway(game: GameState, userId: string): GameState {
   const g = normalizeGameState(game);
   const player = findPlayer(g, userId);
@@ -160,8 +210,18 @@ export function requestSetAway(game: GameState, userId: string): GameState {
     throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'You are not seated.', 400);
   }
 
-  if (player.presence === 'away' && player.seat_intent !== 'pending_away') {
-    return g;
+  // Toggle: if already away (or pending away), bring them back
+  if (player.presence === 'away' || player.seat_intent === 'pending_away') {
+    return {
+      ...g,
+      players: g.players.map((p) =>
+        p.user_id === userId
+          ? { ...p, presence: 'active' as const, seat_intent: 'none' as const }
+          : p
+      ),
+      updated_at: now(),
+      last_action: `${player.display_name} is back`,
+    };
   }
 
   if (canApplySeatIntentNow(player, g)) {
@@ -270,7 +330,6 @@ export function preparePlayersForNewHand(game: GameState): GameState {
         hole_cards: [],
         live_hole_cards: [],
         shredded_cards: [],
-        discard_submitted: false,
         status: 'active' as const,
         current_pip_total: 0,
         final_pip_total: null,
@@ -314,19 +373,22 @@ export function openRebuyWindow(game: GameState): GameState {
     status: 'finished',
     rebuy_deadline_at: deadline,
     rebuy_offered_seats: brokeSeats,
+    pending_rebuys: [],
     last_action: `Rebuy window open (${GAME_CONFIG.REBUY_WINDOW_SECONDS}s) for broke players`,
   };
 }
 
 export function assertCanStartHand(game: GameState): void {
   const g = normalizeGameState(game);
-  if (isRebuyWindowOpen(g)) {
+  const hasPendingRebuys = (g.pending_rebuys || []).length > 0;
+  if (isRebuyWindowOpen(g) || hasPendingRebuys) {
     throw new GameApiError(
       GameErrorCode.WRONG_PHASE,
-      `Rebuy window open — wait ${GAME_CONFIG.REBUY_WINDOW_SECONDS}s or until broke players rebuy.`,
+      `Rebuy window open or pending rebuy approvals — wait or have host approve/deny rebuys before starting new hand.`,
       409
     );
   }
+  // No minimum player count enforced (heads-up / 2+ supported per user direction)
 }
 
 export function playerRebuy(
@@ -359,6 +421,245 @@ export function playerRebuy(
     rebuy_deadline_at: remaining.length === 0 ? null : g.rebuy_deadline_at,
     updated_at: now(),
     last_action: `${player.display_name} rebought for ${(stackCents / 100).toFixed(2)}`,
+  };
+}
+
+/**
+ * If the rebuy deadline has passed and there are still offered seats that didn't rebuy,
+ * force those players to 'away' and clear the rebuy window. Called on mutations (esp. start hand)
+ * so that "out of chips + no rebuy in 10s => away" is enforced automatically.
+ */
+export function applyRebuyTimeouts(game: GameState): GameState {
+  const g = normalizeGameState(game);
+  if (!g.rebuy_deadline_at || (g.rebuy_offered_seats?.length ?? 0) === 0) {
+    return g;
+  }
+  const deadlineMs = new Date(g.rebuy_deadline_at).getTime();
+  if (deadlineMs > Date.now()) {
+    return g; // still open
+  }
+  // Only auto-away the seats still in offered (they didn't request within the 10s).
+  // Keep any pending_rebuys (those who did request in time); host can still approve them later.
+  const offeredSeats = new Set(g.rebuy_offered_seats);
+  const pendingSeats = new Set((g.pending_rebuys || []).map((r) => r.seat));
+  const toAutoAway = new Set([...offeredSeats].filter((s) => !pendingSeats.has(s)));
+  const affectedPlayers = g.players.filter((p) => toAutoAway.has(p.seat));
+  if (affectedPlayers.length === 0) {
+    return { ...g, rebuy_deadline_at: null, rebuy_offered_seats: [] };
+  }
+  const updated = g.players.map((p) =>
+    toAutoAway.has(p.seat) && p.stack <= 0
+      ? { ...p, presence: 'away' as const, seat_intent: 'none' as const, in_current_hand: false }
+      : p
+  );
+  const names = affectedPlayers.map((p) => p.display_name).join(', ');
+  return {
+    ...g,
+    players: updated,
+    rebuy_deadline_at: null,
+    rebuy_offered_seats: [],
+    // pending_rebuys kept for host approval
+    updated_at: now(),
+    last_action: `${names} did not rebuy in time — set away`,
+  };
+}
+
+/** Player requests to add (top-up) chips. Creates a pending request for host approval. */
+export function requestAddChips(game: GameState, userId: string, amountCents: number): GameState {
+  const g = normalizeGameState(game);
+  const player = findPlayer(g, userId);
+  if (!player) {
+    throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'You are not seated.', 400);
+  }
+  if (amountCents <= 0) {
+    throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'Add amount must be positive.', 400);
+  }
+  // Prevent duplicate pending request from same user
+  if (g.pending_chip_adds?.some((r) => r.user_id === userId)) {
+    throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'You already have a pending chip add request.', 409);
+  }
+
+  const req: import('@/types/game').PendingChipAddRequest = {
+    id: crypto.randomUUID(),
+    user_id: userId,
+    seat: player.seat,
+    display_name: player.display_name,
+    amount_cents: amountCents,
+    requested_at: now(),
+  };
+
+  return {
+    ...g,
+    pending_chip_adds: [...(g.pending_chip_adds || []), req],
+    updated_at: now(),
+    last_action: `${player.display_name} requested +${(amountCents / 100).toFixed(2)} chips (pending host approval)`,
+  };
+}
+
+/** Host approves a pending chip add: credit the stack immediately (mid-hand ok for top-up). */
+export function approveAddChips(game: GameState, hostUserId: string, requestId: string): GameState {
+  const g = normalizeGameState(game);
+  if (hostUserId !== g.host_id) {
+    throw new GameApiError(GameErrorCode.HOST_ONLY, 'Host only.', 403);
+  }
+  const pendings = g.pending_chip_adds || [];
+  const req = pendings.find((r) => r.id === requestId);
+  if (!req) {
+    throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'Chip add request not found.', 404);
+  }
+  const player = g.players.find((p) => p.seat === req.seat);
+  if (!player) {
+    // cleanup stale
+    return {
+      ...g,
+      pending_chip_adds: pendings.filter((r) => r.id !== requestId),
+      updated_at: now(),
+    };
+  }
+
+  const newStack = player.stack + req.amount_cents;
+  const updatedPlayers = g.players.map((p) =>
+    p.seat === req.seat ? { ...p, stack: newStack } : p
+  );
+
+  const remaining = pendings.filter((r) => r.id !== requestId);
+  return {
+    ...g,
+    players: updatedPlayers,
+    pending_chip_adds: remaining,
+    updated_at: now(),
+    last_action: `Host approved ${req.display_name}'s +${(req.amount_cents / 100).toFixed(2)} chip add (now ${(newStack / 100).toFixed(2)})`,
+  };
+}
+
+/** Host denies a pending chip add request (no stack change). */
+export function denyAddChips(game: GameState, hostUserId: string, requestId: string): GameState {
+  const g = normalizeGameState(game);
+  if (hostUserId !== g.host_id) {
+    throw new GameApiError(GameErrorCode.HOST_ONLY, 'Host only.', 403);
+  }
+  const pendings = g.pending_chip_adds || [];
+  const req = pendings.find((r) => r.id === requestId);
+  if (!req) {
+    return g;
+  }
+  const remaining = pendings.filter((r) => r.id !== requestId);
+  return {
+    ...g,
+    pending_chip_adds: remaining,
+    updated_at: now(),
+    last_action: `Host denied ${req.display_name}'s chip add request`,
+  };
+}
+
+/** Player requests a rebuy (during the rebuy window). Creates pending for host approval. */
+export function requestRebuy(game: GameState, userId: string, stackCents: number): GameState {
+  const g = normalizeGameState(game);
+  const player = findPlayer(g, userId);
+  if (!player) {
+    throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'You are not seated.', 400);
+  }
+  if (!g.rebuy_offered_seats.includes(player.seat)) {
+    throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'Rebuy is not offered to your seat.', 409);
+  }
+  if (!isRebuyWindowOpen(g)) {
+    throw new GameApiError(GameErrorCode.WRONG_PHASE, 'Rebuy window has closed.', 409);
+  }
+  if (stackCents <= 0) {
+    throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'Rebuy amount must be positive.', 400);
+  }
+  const pendings = g.pending_rebuys || [];
+  if (pendings.some((r) => r.user_id === userId)) {
+    throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'You already have a pending rebuy request.', 409);
+  }
+
+  const req: import('@/types/game').PendingRebuyRequest = {
+    id: crypto.randomUUID(),
+    user_id: userId,
+    seat: player.seat,
+    display_name: player.display_name,
+    starting_stack_cents: stackCents,
+    requested_at: now(),
+  };
+
+  // Remove from offered so player's rebuy modal closes (they have requested), countdown stops for them.
+  // Pending remains for host to approve/deny. This way, approval can happen even after the original 10s window.
+  const remainingOffered = g.rebuy_offered_seats.filter((s) => s !== player.seat);
+
+  return {
+    ...g,
+    rebuy_offered_seats: remainingOffered,
+    rebuy_deadline_at: remainingOffered.length === 0 ? null : g.rebuy_deadline_at,
+    pending_rebuys: [...pendings, req],
+    updated_at: now(),
+    last_action: `${player.display_name} requested rebuy for ${(stackCents / 100).toFixed(2)} (pending host approval)`,
+  };
+}
+
+/** Host approves a rebuy request: performs the rebuy (awards stack), cleans offered and pending. */
+export function approveRebuy(game: GameState, hostUserId: string, requestId: string): GameState {
+  const g = normalizeGameState(game);
+  if (hostUserId !== g.host_id) {
+    throw new GameApiError(GameErrorCode.HOST_ONLY, 'Host only.', 403);
+  }
+  const pendings = g.pending_rebuys || [];
+  const req = pendings.find((r) => r.id === requestId);
+  if (!req) {
+    throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'Rebuy request not found.', 404);
+  }
+
+  // Perform the rebuy (for requests made in time; we allow approve even after the 10s window
+  // since the player requested promptly, and we removed them from offered on request).
+  // No offered or window check here (unlike direct playerRebuy).
+  const player = g.players.find((p) => p.seat === req.seat);
+  if (!player) {
+    return {
+      ...g,
+      pending_rebuys: pendings.filter((r) => r.id !== requestId),
+      updated_at: now(),
+    };
+  }
+
+  const updatedPlayers = g.players.map((p) =>
+    p.user_id === req.user_id ? { ...p, stack: req.starting_stack_cents, presence: 'active' as const } : p
+  );
+
+  const remainingPendings = pendings.filter((r) => r.id !== requestId);
+  // Offered should already be cleaned on request; clean any remaining for this seat
+  const remainingOffered = g.rebuy_offered_seats.filter((s) => s !== req.seat);
+
+  return {
+    ...g,
+    players: updatedPlayers,
+    rebuy_offered_seats: remainingOffered,
+    rebuy_deadline_at: remainingOffered.length === 0 ? null : g.rebuy_deadline_at,
+    pending_rebuys: remainingPendings,
+    updated_at: now(),
+    last_action: `Host approved ${req.display_name}'s rebuy for ${(req.starting_stack_cents / 100).toFixed(2)}`,
+  };
+}
+
+/** Host denies a rebuy request. */
+export function denyRebuy(game: GameState, hostUserId: string, requestId: string): GameState {
+  const g = normalizeGameState(game);
+  if (hostUserId !== g.host_id) {
+    throw new GameApiError(GameErrorCode.HOST_ONLY, 'Host only.', 403);
+  }
+  const pendings = g.pending_rebuys || [];
+  const req = pendings.find((r) => r.id === requestId);
+  if (!req) {
+    return g;
+  }
+  // On deny, also remove from offered so they can't re-request in this window
+  const remainingOffered = g.rebuy_offered_seats.filter((s) => s !== req.seat);
+  const remainingPendings = pendings.filter((r) => r.id !== requestId);
+  return {
+    ...g,
+    rebuy_offered_seats: remainingOffered,
+    rebuy_deadline_at: remainingOffered.length === 0 ? null : g.rebuy_deadline_at,
+    pending_rebuys: remainingPendings,
+    updated_at: now(),
+    last_action: `Host denied ${req.display_name}'s rebuy request`,
   };
 }
 

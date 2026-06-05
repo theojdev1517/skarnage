@@ -35,12 +35,12 @@ export function BettingControls({
   }, [game, player.seat, wagerAction]);
 
   const defaultWagerTo = bounds?.minWagerTo ?? game.blinds.big;
-  const [wagerInput, setWagerInput] = useState(() => (defaultWagerTo / 100).toString());
+  const [wagerInput, setWagerInput] = useState(() => (defaultWagerTo / 100).toFixed(2));
   const [wagerError, setWagerError] = useState<string | null>(null);
   const [foldConfirmOpen, setFoldConfirmOpen] = useState(false);
 
   useEffect(() => {
-    if (bounds) setWagerInput((bounds.minWagerTo / 100).toString());
+    if (bounds) setWagerInput((bounds.minWagerTo / 100).toFixed(2));
   }, [bounds?.minWagerTo, bounds?.maxWagerTo, game.current_player_seat, game.status]);
 
   const submitWager = async () => {
@@ -69,7 +69,7 @@ export function BettingControls({
   };
 
   const setWagerToCents = (cents: number) => {
-    setWagerInput((cents / 100).toString());
+    setWagerInput((cents / 100).toFixed(2));
   };
 
   const runBetAction = async (
@@ -134,8 +134,16 @@ export function BettingControls({
           inputMode="decimal"
           value={wagerInput}
           onChange={(e) => {
-            setWagerInput(e.target.value);
+            // Auto-decimal input: only digits, treat as cents (e.g. 1→0.01, 12→0.12, 123→1.23, 1234→12.34)
+            const rawDigits = e.target.value.replace(/\D/g, '').slice(0, 8); // limit digits
+            const cents = rawDigits ? parseInt(rawDigits, 10) : 0;
+            const formatted = (cents / 100).toFixed(2);
+            setWagerInput(formatted);
             if (wagerError) setWagerError(null);
+          }}
+          onFocus={(e) => {
+            // Highlight/select on click/focus for quick replace typing
+            e.target.select();
           }}
           onKeyDown={(e) => {
             if (e.key === 'Enter') {
@@ -177,12 +185,14 @@ export function BettingControls({
         </p>
       )}
 
-      <div className="grid grid-cols-3 gap-1">
+      {/* Stack-sensitive buttons: if facing a bet larger than (or equal) our remaining stack, only Fold + Call (all-in); no Raise option.
+          Always print the call amount on the Call button when there is an active bet to call. */}
+      <div className="flex gap-1">
         <button
           type="button"
           disabled={busy}
           onClick={handleFoldClick}
-          className="py-2 rounded text-xs font-medium bg-red-700 hover:bg-red-600 disabled:opacity-50"
+          className="flex-1 py-2 rounded text-xs font-medium bg-red-700 hover:bg-red-600 disabled:opacity-50"
         >
           Fold
         </button>
@@ -192,18 +202,27 @@ export function BettingControls({
               type="button"
               disabled={busy}
               onClick={() => void runBetAction('call')}
-              className="py-2 rounded text-xs font-medium bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
+              className="flex-1 py-2 rounded text-xs font-medium bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
             >
-              Call{bounds && bounds.toCall > 0 ? ` ${formatStack(bounds.toCall)}` : ''}
+              Call {bounds && bounds.toCall > 0 ? formatStack(Math.min(bounds.toCall, player.stack)) : ''}
             </button>
-            <button
-              type="button"
-              disabled={busy || !bounds}
-              onClick={() => void submitWager()}
-              className="py-2 rounded text-xs font-medium bg-amber-600 hover:bg-amber-500 disabled:opacity-50"
-            >
-              Raise
-            </button>
+            {player.stack > (bounds?.toCall ?? 0) && (
+              <button
+                type="button"
+                disabled={busy || !bounds}
+                onClick={() => void submitWager()}
+                className="flex-1 py-2 rounded text-xs font-medium bg-amber-600 hover:bg-amber-500 disabled:opacity-50"
+              >
+                {(() => {
+                  if (!bounds) return 'Raise';
+                  const inputCents = dollarsToCents(wagerInput);
+                  let amt = bounds.minWagerTo;
+                  if (inputCents !== null && inputCents > 0) amt = inputCents;
+                  // Always show numeric amount (even for pot/max); e.g. "Raise 99.75"
+                  return `Raise ${formatStack(amt)}`;
+                })()}
+              </button>
+            )}
           </>
         ) : (
           <>
@@ -211,7 +230,7 @@ export function BettingControls({
               type="button"
               disabled={busy}
               onClick={() => void runBetAction('check')}
-              className="py-2 rounded text-xs font-medium bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
+              className="flex-1 py-2 rounded text-xs font-medium bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
             >
               Check
             </button>
@@ -219,9 +238,16 @@ export function BettingControls({
               type="button"
               disabled={busy || !bounds}
               onClick={() => void submitWager()}
-              className="py-2 rounded text-xs font-medium bg-amber-600 hover:bg-amber-500 disabled:opacity-50"
+              className="flex-1 py-2 rounded text-xs font-medium bg-amber-600 hover:bg-amber-500 disabled:opacity-50"
             >
-              Bet
+              {(() => {
+                if (!bounds) return 'Bet';
+                const inputCents = dollarsToCents(wagerInput);
+                let amt = bounds.minWagerTo;
+                if (inputCents !== null && inputCents > 0) amt = inputCents;
+                // Always show numeric (e.g. "Bet 99.75" even for pot)
+                return `Bet ${formatStack(amt)}`;
+              })()}
             </button>
           </>
         )}

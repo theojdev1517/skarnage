@@ -17,12 +17,20 @@ export type GameMutationAction =
   | 'hostRemoveStack'
   | 'hostSetStack'
   | 'hostTransfer'
+  | 'hostForceAway'
+  | 'hostRemovePlayer'
   | 'requestJoin'
   | 'approveJoin'
   | 'denyJoin'
   | 'setAway'
   | 'standUp'
   | 'rebuy'
+  | 'requestAddChips'
+  | 'approveAddChips'
+  | 'denyAddChips'
+  | 'requestRebuy'
+  | 'approveRebuy'
+  | 'denyRebuy'
   | 'turnTimeout';
 
 export function assertPhaseAllows(game: GameState, mutation: GameMutationAction): void {
@@ -58,9 +66,17 @@ export function assertPhaseAllows(game: GameState, mutation: GameMutationAction)
     case 'setAway':
     case 'standUp':
     case 'rebuy':
+    case 'requestAddChips':
+    case 'approveAddChips':
+    case 'denyAddChips':
+    case 'requestRebuy':
+    case 'approveRebuy':
+    case 'denyRebuy':
       return;
 
     case 'hostTransfer':
+    case 'hostForceAway':
+    case 'hostRemovePlayer':
       return;
 
     case 'hostAddStack':

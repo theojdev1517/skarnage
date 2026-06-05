@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import type { GameState, Player } from '@/types/game';
 import { dollarsToCents, formatStack } from '@/lib/formatStack';
+import { ConfirmModal } from '@/components/game/ConfirmModal';
 
 type SeatHostMenuProps = {
   game: GameState;
@@ -26,15 +27,16 @@ export function SeatHostMenu({
   const [setAmount, setSetAmount] = useState('');
   const [busy, setBusy] = useState(false);
   const [menuError, setMenuError] = useState<string | null>(null);
+  const [removeConfirmOpen, setRemoveConfirmOpen] = useState(false);
 
   useEffect(() => {
     const close = () => onClose();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') close();
+      if (e.key === 'Escape' && !removeConfirmOpen) close();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
+  }, [onClose, removeConfirmOpen]);
 
   const run = async (payload: Record<string, unknown>) => {
     setBusy(true);
@@ -160,7 +162,40 @@ export function SeatHostMenu({
         >
           Transfer host here
         </button>
+
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => run({ action: 'hostForceAway', seat: player.seat })}
+          className="w-full text-left px-3 py-2 text-xs hover:bg-zinc-800 disabled:opacity-40"
+        >
+          Force away
+        </button>
+
+        <button
+          type="button"
+          disabled={busy || isCurrentHost}
+          onClick={() => setRemoveConfirmOpen(true)}
+          className="w-full text-left px-3 py-2 text-xs text-red-400 hover:bg-red-950/60 disabled:opacity-40"
+        >
+          Remove from seat
+        </button>
       </div>
+
+      <ConfirmModal
+        open={removeConfirmOpen}
+        title="Remove player from seat?"
+        message={`Host will immediately remove ${player.display_name} (seat ${player.seat}) from the table. This cannot be undone.`}
+        confirmLabel="Remove player"
+        cancelLabel="Cancel"
+        variant="danger"
+        busy={busy}
+        onCancel={() => setRemoveConfirmOpen(false)}
+        onConfirm={() => {
+          setRemoveConfirmOpen(false);
+          void run({ action: 'hostRemovePlayer', seat: player.seat });
+        }}
+      />
     </>
   );
 }

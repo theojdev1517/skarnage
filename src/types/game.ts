@@ -3,16 +3,9 @@ export type Card = string; // e.g. "Ah", "2d", "Ks", "10h"
 
 export type GameStatus =
   | "waiting"
-  | "buying_in"
   | "preflop_betting"
-  | "flop_dealt"
-  | "flop_discard"
   | "flop_betting"
-  | "turn_dealt"
-  | "turn_discard"
   | "turn_betting"
-  | "river_dealt"
-  | "river_discard"
   | "river_betting"
   | "showdown"
   | "finished";
@@ -30,7 +23,6 @@ export interface Player {
   hole_cards: Card[];
   live_hole_cards: Card[];
   shredded_cards: Card[];
-  discard_submitted: boolean;
   status: "active" | "folded" | "all_in" | "dead";
   current_pip_total: number;
   final_pip_total: number | null;
@@ -44,6 +36,24 @@ export interface Player {
 }
 
 export interface PendingJoinRequest {
+  id: string;
+  user_id: string;
+  seat: number;
+  display_name: string;
+  starting_stack_cents: number;
+  requested_at: string;
+}
+
+export interface PendingChipAddRequest {
+  id: string;
+  user_id: string;
+  seat: number;
+  display_name: string;
+  amount_cents: number;
+  requested_at: string;
+}
+
+export interface PendingRebuyRequest {
   id: string;
   user_id: string;
   seat: number;
@@ -68,6 +78,11 @@ export interface ShowdownSummary {
   low_winners: (ShowdownWinnerSummary & { pips: number })[];
 }
 
+export interface SidePot {
+  amount: number; // cents in this pot layer
+  eligible: string[]; // user_ids of players who can win this pot (contributed at/above the layer)
+}
+
 export interface GameState {
   game_id: string;
   host_id: string;
@@ -83,8 +98,7 @@ export interface GameState {
   current_player_seat: number | null;
   button_seat: number;
   last_aggressor_seat: number | null;
-  skip_discard_eligible: boolean;
-  side_pots: unknown[];
+  side_pots: SidePot[];
   action_history: unknown[];
   last_action: string;
   showdown_summary?: ShowdownSummary | null;
@@ -92,6 +106,8 @@ export interface GameState {
   deck_index: number;
   hasBigBlindActedThisStreet?: boolean;
   pending_joins: PendingJoinRequest[];
+  pending_chip_adds: PendingChipAddRequest[];
+  pending_rebuys: PendingRebuyRequest[];
   turn_deadline_at: string | null;
   rebuy_deadline_at: string | null;
   rebuy_offered_seats: number[];
