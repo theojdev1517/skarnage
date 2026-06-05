@@ -64,6 +64,18 @@ function ranksByCount(cards: Card[], count: number): string[] {
     .sort((a, b) => RANK_VALUE.get(b)! - RANK_VALUE.get(a)!);
 }
 
+/** A-2-3-4-5 straight; ace is low, so the high card is five — not ace. */
+function isWheelStraight(cards: Card[]): boolean {
+  const ranks = cards.map(parseCardRank);
+  if (ranks.length !== 5) return false;
+  const unique = new Set(ranks);
+  return unique.size === 5 && ['A', '2', '3', '4', '5'].every((r) => unique.has(r));
+}
+
+function straightHighRank(cards: Card[]): string {
+  return isWheelStraight(cards) ? '5' : parseCardRank(sortCardsDescending(cards)[0]);
+}
+
 function describeFiveCardHand(cards: Card[], handRank: HandRank): string {
   const sorted = sortCardsDescending(cards);
   const kickers = ranksByCount(sorted, 1);
@@ -72,7 +84,7 @@ function describeFiveCardHand(cards: Card[], handRank: HandRank): string {
     case "royal_flush":
       return "Royal Flush";
     case "straight_flush": {
-      const high = parseCardRank(sorted[0]);
+      const high = straightHighRank(cards);
       return high === "5" ? "Five-high Straight Flush" : `${rankLabel(high)}-high Straight Flush`;
     }
     case "four_kind": {
@@ -90,7 +102,7 @@ function describeFiveCardHand(cards: Card[], handRank: HandRank): string {
     case "flush":
       return `${rankLabel(parseCardRank(sorted[0]))}-high Flush`;
     case "straight": {
-      const high = parseCardRank(sorted[0]);
+      const high = straightHighRank(cards);
       return high === "5" ? "Five-high Straight" : `${rankLabel(high)}-high Straight`;
     }
     case "three_kind": {
@@ -216,9 +228,14 @@ function rankFiveCards(cards: Card[]): { rank: HandRank; score: number; cards: C
     baseScore = 1_000_000;
   }
 
-  const kickerScore = sorted.reduce((acc, card, idx) => 
-    acc + getRankValue(card) * Math.pow(15, 4 - idx), 0
+  let kickerScore = sorted.reduce(
+    (acc, card, idx) => acc + getRankValue(card) * Math.pow(15, 4 - idx),
+    0
   );
+  if (isStraight) {
+    const highVal = isWheelStraight(sorted) ? 5 : uniqueVals[0];
+    kickerScore = highVal * Math.pow(15, 4);
+  }
 
   return {
     rank: handRank,
