@@ -95,6 +95,18 @@ export function requestJoin(
     );
   }
 
+  const normName = displayName.trim().toLowerCase();
+  if (
+    g.players.some((p) => p.display_name.trim().toLowerCase() === normName) ||
+    g.pending_joins.some((j) => j.display_name.trim().toLowerCase() === normName)
+  ) {
+    throw new GameApiError(
+      GameErrorCode.INVALID_REQUEST,
+      'That display name is already taken or requested at this table.',
+      409
+    );
+  }
+
   const request: PendingJoinRequest = {
     id: crypto.randomUUID(),
     user_id: userId,
@@ -162,6 +174,18 @@ export function directJoin(
 
   if (g.players.some((p) => p.seat === seat)) {
     throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'That seat is already taken.', 409);
+  }
+
+  const normName = displayName.trim().toLowerCase();
+  if (
+    g.players.some((p) => p.display_name.trim().toLowerCase() === normName) ||
+    g.pending_joins.some((j) => j.display_name.trim().toLowerCase() === normName)
+  ) {
+    throw new GameApiError(
+      GameErrorCode.INVALID_REQUEST,
+      'That display name is already taken or requested at this table.',
+      409
+    );
   }
 
   // Note: we intentionally do NOT check/create pending_joins here — this is the direct/auto path.

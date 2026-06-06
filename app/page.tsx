@@ -55,7 +55,7 @@ export default function Home() {
       <div className="text-center">
         <h1 className="text-7xl font-bold mb-8 text-emerald-400 tracking-wider">SKARNEY</h1>
         <p className="text-xl text-gray-300 mb-12 max-w-md mx-auto">
-          Friends-only Icelandic poker with automatic shredding
+          The Incredible. The Impossible. The Frustrating.
         </p>
 
         {authError && (

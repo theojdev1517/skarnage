@@ -51,6 +51,7 @@ export function normalizeGameState(game: GameState): GameState {
     turn_deadline_at: game.turn_deadline_at ?? null,
     rebuy_deadline_at: game.rebuy_deadline_at ?? null,
     rebuy_offered_seats: game.rebuy_offered_seats ?? [],
+    showdown_deadline_at: game.showdown_deadline_at ?? null,
     players: game.players.map(normalizePlayer),
   };
 }

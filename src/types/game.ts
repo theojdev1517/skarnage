@@ -111,6 +111,8 @@ export interface GameState {
   turn_deadline_at: string | null;
   rebuy_deadline_at: string | null;
   rebuy_offered_seats: number[];
+  /** Timer after reaching showdown (results visible) before auto awardPot. Invisible to players. */
+  showdown_deadline_at?: string | null;
   /** Previous hand blind seats — used to prevent skip / triple blind posts. */
   last_blinds?: {
     small_seat: number | null;

@@ -10,6 +10,7 @@ import {
   assertPhaseAllows,
   parseBetAction,
 } from '@/lib/game/actionGuards';
+import { isRebuyWindowOpen } from '@/lib/game/playerLifecycle';
 import { applyJoinRequest } from '@/lib/game/joinGame';
 import {
   approveJoin,
@@ -82,8 +83,33 @@ export async function GET(
     const loaded = await loadGame(supabase, gameId);
     if (loaded instanceof NextResponse) return loaded;
 
+    // Enforce timers and auto-advance on read (so passive clients / realtime refetches
+    // catch up expired showdown timers, rebuy windows, and auto-start next hand without
+    // requiring an explicit client mutation/POST).
+    let game = applyRebuyTimeouts(loaded.game);
+    game = engine.applyShowdownTimeout(game);
+
+    if (
+      game.status === 'finished' &&
+      !isRebuyWindowOpen(game) &&
+      (game.pending_rebuys || []).length === 0
+    ) {
+      game = engine.startNewHand(game);
+    }
+
+    // If we advanced the state (timers fired or hand auto-started), attempt to persist.
+    // Use original version for optimistic lock. On conflict, ignore — caller gets
+    // advanced view and next fetch/realtime will converge.
+    if (game.updated_at !== loaded.game.updated_at) {
+      try {
+        await saveGameState(supabase, gameId, loaded.version, game, {});
+      } catch (e) {
+        // Stale concurrent update or other; safe to ignore for this response.
+      }
+    }
+
     return NextResponse.json({
-      game: sanitizeGameStateForUser(loaded.game, user?.id ?? null),
+      game: sanitizeGameStateForUser(game, user?.id ?? null),
     });
   } catch (error) {
     console.error('API GET Error:', error);
@@ -118,7 +144,9 @@ export async function POST(
 
     const { game: loadedGame, version } = loaded;
     // Apply any expired rebuy timeouts (sets broke non-rebuyers to away after 10s window)
-    const game = applyRebuyTimeouts(loadedGame);
+    let game = applyRebuyTimeouts(loadedGame);
+    // Apply invisible showdown timer: if past, perform awardPot now (pots, finished state, rebuy window)
+    game = engine.applyShowdownTimeout(game);
     let result: GameState;
     let hostIdUpdate: string | undefined;
 
@@ -386,6 +414,20 @@ export async function POST(
           `Unknown action: ${String(action)}`,
           400
         );
+    }
+
+    // Auto-advance to next hand (removes manual "New Hand" button for ongoing games).
+    // Triggers once: pots awarded (status 'finished' after awardPot), rebuys processed
+    // (window closed + no pending_rebuys after applyRebuyTimeouts + approvals/denies at top),
+    // and any showdown timer has fired (via applyShowdownTimeout above).
+    // The initial unstarted game (status 'waiting') still requires the host's manual
+    // "Start Game" button + 'startHand' action (one-time).
+    if (
+      result.status === 'finished' &&
+      !isRebuyWindowOpen(result) &&
+      (result.pending_rebuys || []).length === 0
+    ) {
+      result = engine.startNewHand(result);
     }
 
     await saveGameState(supabase, gameId, version, result, {

@@ -7,6 +7,8 @@ import {
   isInLiveHand,
   shouldDealCardsTo,
   withTurnDeadline,
+  addSeconds,
+  normalizeGameState,
 } from "./playerLifecycle";
 import {
   applySeatIntentAfterFold,
@@ -35,6 +37,7 @@ import {
   liveShowdownPlayers,
 } from "./showdown";
 import { now } from "./time";
+import { GAME_CONFIG } from "./config";
 
 export { now };
 
@@ -92,6 +95,7 @@ export function createNewGame(
     turn_deadline_at: null,
     rebuy_deadline_at: null,
     rebuy_offered_seats: [],
+    showdown_deadline_at: null,
   };
 }
 
@@ -475,15 +479,13 @@ export function processBet(
       (p) =>
         p.in_current_hand && (p.status === "active" || p.status === "all_in")
     );
-    return awardPot({
+    const base = {
       ...result,
-      status: "showdown",
-      current_player_seat: null,
-      turn_deadline_at: null,
       last_action: winner
         ? `${winner.display_name} wins the pot (everyone else folded)`
         : result.last_action,
-    });
+    };
+    return enterShowdownWithTimer(base);
   }
 
   // Auto-proceed only if no more betting action possible (i.e. the last active player
@@ -491,17 +493,14 @@ export function processBet(
   // covered player gets to call/fold/raise before auto-advancing on all-ins.
   if (countBettingPlayers(result) > 1 && noMoreBettingActionPossible(result)) {
     result = advanceToNextPhase(result);
-    if (result.status === 'showdown') {
-      result = awardPot(result);
-    }
+    // Do not auto-award here; if it reached showdown, enterShowdownWithTimer was used
+    // and award will happen later via applyShowdownTimeout on the next mutation.
     return result;
   }
 
   if (isBettingRoundComplete(result)) {
     result = advanceToNextPhase(result);
-    if (result.status === 'showdown') {
-      result = awardPot(result);
-    }
+    // Do not auto-award here; showdown timer (if reached) will award on next apply.
   }
 
   return withTurnDeadline(result);
@@ -642,6 +641,7 @@ export function awardPot(game: GameState): GameState {
     last_action: last_action || 'Hand complete (no eligible winners)',
     showdown_summary,
     turn_deadline_at: null,
+    showdown_deadline_at: null,
   };
 
   // Apply any pending chip adds *after the pot has been awarded* (post-payouts).
@@ -661,6 +661,56 @@ export function awardPot(game: GameState): GameState {
     turn_deadline_at: null,
   };
   return openRebuyWindow(finished);
+}
+
+/**
+ * Sets up the "showdown" state with an invisible timer.
+ * Pre-computes the summary so the UI can display results (who won, hands, etc.)
+ * during the pause, but does NOT award stacks or open rebuys yet.
+ * The actual awardPot (stack updates + finished + rebuy window) happens
+ * when applyShowdownTimeout fires after the timer (on next API mutation).
+ */
+function enterShowdownWithTimer(game: GameState, lastActionOverride?: string): GameState {
+  let g: GameState = {
+    ...game,
+    status: "showdown" as GameStatus,
+    current_player_seat: null,
+    turn_deadline_at: null,
+    showdown_deadline_at: addSeconds(new Date().toISOString(), GAME_CONFIG.SHOWDOWN_TIMER_SECONDS),
+  };
+
+  if (lastActionOverride) {
+    g.last_action = lastActionOverride;
+  }
+
+  // Pre-compute summary for UI visibility during the (invisible) 10s pause.
+  // Detailed payout amounts and stack changes are finalized later in awardPot.
+  const fullResolution = resolveShowdown(g);
+  g.showdown_summary = buildShowdownSummary(fullResolution);
+
+  return g;
+}
+
+/**
+ * If in "showdown" and the invisible timer has expired, perform the award now.
+ * Called on every API mutation (like applyRebuyTimeouts) so that after the pause,
+ * the next player action (or rebuy request) triggers the award, finished state,
+ * and rebuy window.
+ */
+export function applyShowdownTimeout(game: GameState): GameState {
+  const g = normalizeGameState(game);
+  if (g.status !== "showdown" || !g.showdown_deadline_at) return g;
+
+  const deadlineMs = new Date(g.showdown_deadline_at).getTime();
+  if (deadlineMs > Date.now()) return g;
+
+  // Timer expired — award the pot (this will set finished, update stacks, open rebuys, etc.)
+  const gameForAward = {
+    ...g,
+    showdown_deadline_at: null,
+  };
+
+  return awardPot(gameForAward);
 }
 
 function firstActiveSeat(state: GameState, preferred: number | null): number | null {
@@ -951,6 +1001,7 @@ export function startNewHand(game: GameState): GameState {
     showdown_summary: null,
     hasBigBlindActedThisStreet: false,
     turn_deadline_at: null,
+    showdown_deadline_at: null,
   };
 
   newGame = postBlinds(newGame);
@@ -960,11 +1011,10 @@ export function startNewHand(game: GameState): GameState {
   // would revert special cases and cause wrong first actor (e.g. BB getting first action).
 
   // If all remaining players are all-in after blinds/holes (no one can act preflop), auto run the streets to showdown.
+  // We let it reach the showdown+timer state (instead of immediate award) so players get the
+  // 10s pause to see hole cards + results before pots are awarded.
   if (getActingPlayers(newGame).length === 0 && countBettingPlayers(newGame) > 1) {
     newGame = advanceToNextPhase(newGame);
-    if (newGame.status === 'showdown') {
-      newGame = awardPot(newGame);
-    }
     return newGame;
   }
 
@@ -1068,15 +1118,13 @@ export function advanceToNextPhase(game: GameState): GameState {
       (p) =>
         p.in_current_hand && (p.status === "active" || p.status === "all_in")
     );
-    return awardPot({
+    const base = {
       ...game,
-      status: "showdown",
-      current_player_seat: null,
-      turn_deadline_at: null,
       last_action: winner
         ? `${winner.display_name} wins the pot`
         : game.last_action,
-    });
+    };
+    return enterShowdownWithTimer(base);
   }
 
   let newGame = { ...game };
@@ -1117,9 +1165,6 @@ export function advanceToNextPhase(game: GameState): GameState {
     newGame.status = "showdown" as GameStatus;
     newGame.current_player_seat = null;
   } 
-  else if (game.status === "showdown") {
-    return awardPot(newGame);
-  }
 
   newGame.updated_at = now();
 
@@ -1128,14 +1173,15 @@ export function advanceToNextPhase(game: GameState): GameState {
   // chance before auto-advancing the rest of the hand.
   if (countBettingPlayers(newGame) > 1 && noMoreBettingActionPossible(newGame)) {
     if (newGame.status === 'showdown') {
-      return awardPot(newGame);
+      // Reached showdown via auto — use timer instead of immediate award
+      return enterShowdownWithTimer(newGame);
     }
     newGame.current_player_seat = null; // don't expose turn to the lone actor
     return advanceToNextPhase(newGame);
   }
 
   if (newGame.status === 'showdown') {
-    return awardPot(newGame);
+    return enterShowdownWithTimer(newGame);
   }
 
   return withTurnDeadline(newGame);

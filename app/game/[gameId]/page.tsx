@@ -108,6 +108,37 @@ export default function GamePage() {
     };
   }, [rebuyOffered, game?.rebuy_deadline_at, game, rebuyInteracting]);
 
+  // Client-side nudge: after known deadlines (showdown or rebuy timers), force a refresh.
+  // This triggers server-side apply*Timeout + auto-advance even with no other user actions/POSTs.
+  // Ensures "auto" without requiring interaction after timers expire (e.g. no rebuys needed, or after window).
+  useEffect(() => {
+    if (!game) return;
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    const scheduleNudge = (deadline: string | null | undefined) => {
+      if (!deadline) return;
+      const target = new Date(deadline).getTime();
+      const ms = Math.max(0, target - Date.now() + 500);
+      const t = setTimeout(() => {
+        refresh().catch(() => {});
+      }, ms);
+      timers.push(t);
+    };
+    scheduleNudge(game.showdown_deadline_at);
+    scheduleNudge(game.rebuy_deadline_at);
+    // If already past on mount, nudge soon
+    if (game.showdown_deadline_at && new Date(game.showdown_deadline_at).getTime() < Date.now()) {
+      const t = setTimeout(() => refresh().catch(() => {}), 0);
+      timers.push(t);
+    }
+    if (game.rebuy_deadline_at && new Date(game.rebuy_deadline_at).getTime() < Date.now()) {
+      const t = setTimeout(() => refresh().catch(() => {}), 0);
+      timers.push(t);
+    }
+    return () => {
+      timers.forEach(clearTimeout);
+    };
+  }, [game?.showdown_deadline_at, game?.rebuy_deadline_at, refresh]);
+
   const postGameAction = async (body: Record<string, unknown>) => {
     const res = await fetch(`/api/game/${gameId}`, {
       method: 'POST',
@@ -289,7 +320,9 @@ export default function GamePage() {
   const shredderBoard = game.board.shredder.filter((c): c is Card => c !== null);
   const hasHoleCards =
     (myPlayer?.hole_cards?.length ?? 0) > 0 || (myPlayer?.live_hole_cards?.length ?? 0) > 0;
-  const showShowdown = game.status === 'finished' && game.showdown_summary;
+  // Show results during the invisible showdown timer (status 'showdown' with precomputed summary)
+  // as well as after award (finished). This gives the 10s pause for players to process.
+  const showShowdown = (game.status === 'showdown' || game.status === 'finished') && !!game.showdown_summary;
 
   const toCall =
     myPlayer && isBettingPhase(game.status)
@@ -324,13 +357,13 @@ export default function GamePage() {
           >
             New Game
           </button>
-          {isHost && (
+          {isHost && game.status === 'waiting' && (
             <button
               type="button"
               onClick={() => void runAction({ action: 'startHand' })}
               className="bg-emerald-600 hover:bg-emerald-500 px-3 py-1 rounded font-medium"
             >
-              New Hand
+              Start Game
             </button>
           )}
         </div>
