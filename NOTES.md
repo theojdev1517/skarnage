@@ -47,9 +47,16 @@
 - **High half tie:** extra cent(s) within that half go to **worst position** (not earliest seat)
 - (Fixed 2026-06: odd cent now to high half via Math.ceil; high ties use reverse-seat order in splitShare)
 
-**Buy-ins & Stacks**:
-- Target: initial buy-in exactly $100.00 (join flow defaults to 100; strict enforcement todo)
-- Rebuys allowed anytime, up to the current largest stack
+**Buy-ins & Stacks** (auto / direct as of 2026):
+- Initial buy-in (pre-start, while status==="waiting"): **always exactly $100.00**. Host creation and any seats taken before first hand are locked to 100 (direct seating, no host approval). Grayed/fixed in UI.
+- Post-start joins and rebuys: min always exactly 100. Max per stepped rule based on current largest positive stack (computed after payouts for rebuy offers):
+  - largest <= 100 → max 100
+  - 100 < largest <= 200 → max = largest (100% match)
+  - 200 < largest <= 266.66 → max = 200
+  - largest > 266.66 → max = 75% of largest, rounded to nearest 5
+- Player chooses via slider + text box (rebuy box starts with slider at 100 but text blank to avoid misclicks; "OK" uses the box value).
+- All standard buy-ins and rebuys are **direct** (immediate seat or stack set, no pending request + host approval). The enforcement of the rules replaces the need for host policing of stacks.
+- Rebuy offers still use the 10s window for broke players (after awardPot updates stacks). "Leave Table" option in rebuy chooser stands the player up.
 - Display stacks with two decimal places (100.00)
 
 **Host Powers (Critical for MVP)**:
@@ -167,12 +174,14 @@
 - 2026-06-xx: All-in auto-advance fix: Reordered isBettingRoundComplete so acting<=1 complete only *after* everyoneMatched (previously early true even if last covered player bet_this < current, i.e. hadn't called the all-in). Updated noMoreBettingActionPossible helper + early guards in processBet/advanceToNextPhase to only auto when last active has matched (or no wager). Ensures remaining player gets explicit turn to call all-ins before auto streets/showdown. (Matches the 3p test: second all-in on turn no longer skips the 3rd's call.)
 - 2026-06-xx: Call button label fix: when facing bet > stack, now labels "Call [min(toCall, stack)]" (the actual amount that will be called / all-in amount) instead of full bet amount. (Calc was already correct.)
 - 2026-06-xx: Rebuy UX fixes: requestRebuy now removes the seat from rebuy_offered_seats (so player's modal closes immediately on refresh, countdown stops for them). applyRebuyTimeouts only auto-aways seats still in offered (keeps pending_rebuys for those who requested in time). approveRebuy no longer requires window open or offered (allows host to approve timely requests even if 10s passed before clicking approve; just cleans if no req). assertCanStartHand now also blocks if pending_rebuys (host must resolve before next hand). This addresses modal staying after request, approve after timeout doing nothing, etc.
-- Future (do not code): Rebuys should calculate min (constant) and max (half the largest stack at time of award, before popping rebuy modal). Requires awarding pot first to know largest stack for the calc. Add to house rules: "Rebuys allowed anytime, up to the current largest stack" (update calc).
+- 2026-xx: Auto buy-ins & rebuys implemented (direct, no host approval for standard cases). Initial always exactly 100 while status==="waiting" (direct seat on create + pre-start joins). Post-start: min 100 / max per 4-bucket rule on largest positive stack (post-payout for rebuys). New directJoin + enhanced playerRebuy with getBuyInRange enforcement. Rebuy chooser: RebuyStackModal (slider starts 100, text box blank on open, "OK" uses box value, "Leave Table" does standUp). Joins use direct 'join' action. Pending approval paths bypassed for normal buy-ins/rebuys (Host*Approvals lists now empty for these). Future auto next-hand / showdown timer compatible via existing window + direct apply.
+- Future (do not code): Rebuys should calculate min (constant) and max (half the largest stack at time of award, before popping rebuy modal). Requires awarding pot first to know largest stack for the calc. Add to house rules: "Rebuys allowed anytime, up to the current largest stack" (update calc). (Note: superseded by the auto 100 + stepped max rule above.)
 
 ## To-Do List
 - Playtest with 4–6 players; fix UX issues found (these 8 now done)
 - ledger_events + replay view
 - Input-commitment shuffler
+- Connection drop / browser close / disconnect detection for seated players: detect when a player closes tab, loses network, etc. (without them explicitly standing up or going away). Game should not stall waiting for a disconnected player's turn; auto-mark them away / skip / auto-fold as close to instantly as possible. (See example: phone tab closed, hand started, turn waited for them.)
 
 - $100/hand cap
 - Mobile polish, RLS, nicer visuals (medium)

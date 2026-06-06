@@ -20,6 +20,8 @@ export type GameMutationAction =
   | 'hostForceAway'
   | 'hostRemovePlayer'
   | 'requestJoin'
+  | 'join'
+  | 'addChips'
   | 'approveJoin'
   | 'denyJoin'
   | 'setAway'

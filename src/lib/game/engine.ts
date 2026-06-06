@@ -12,6 +12,7 @@ import {
   applySeatIntentAfterFold,
   applyRebuyTimeouts,
   assertTurnTimerExpired,
+  applyPendingChipAdds,
   openRebuyWindow,
   preparePlayersForNewHand,
   activateEligiblePlayersForHand,
@@ -43,13 +44,15 @@ export function createNewGame(
   hostName: string,
   startingStackCents: number
 ): GameState {
-  if (startingStackCents < 0) throw new Error("Starting stack cannot be negative");
+  // Initial buy-in is always exactly 100 (pre-start / creation). Ignore caller value.
+  const INITIAL_BUY_IN_CENTS = 10000;
+  const stackCents = INITIAL_BUY_IN_CENTS;
 
   const hostPlayer = defaultPlayerFields({
     user_id: hostId,
     seat: 1,
     display_name: hostName,
-    stack: startingStackCents,
+    stack: stackCents,
     contributed_this_hand: 0,
     bet_this_street: 0,
     hole_cards: [],
@@ -80,7 +83,7 @@ export function createNewGame(
     last_aggressor_seat: null,
     side_pots: [],
     action_history: [],
-    last_action: `${hostName} created the table (seat 1, ${formatChips(startingStackCents)} chips)`,
+    last_action: `${hostName} created the table (seat 1, ${formatChips(stackCents)} chips)`,
     deck: [],
     deck_index: 0,
     pending_joins: [],
@@ -628,7 +631,7 @@ export function awardPot(game: GameState): GameState {
           .filter(Boolean)
           .join(' · ');
 
-  const finished = {
+  const preAddFinished = {
     ...game,
     players: updatedPlayers,
     pot: 0,
@@ -637,6 +640,23 @@ export function awardPot(game: GameState): GameState {
     status: "finished" as GameStatus,
     updated_at: now(),
     last_action: last_action || 'Hand complete (no eligible winners)',
+    showdown_summary,
+    turn_deadline_at: null,
+  };
+
+  // Apply any pending chip adds *after the pot has been awarded* (post-payouts).
+  // This is the required timing:
+  // - Adds requested mid-hand are credited now (not during the hand).
+  // - Bounding (cap to current buy-in max) uses post-award stacks / largest.
+  // - If a player went broke this hand but had a pending add, they receive it here.
+  // - openRebuyWindow (broke detection + rebuy offers/modals) then sees the post-add stacks.
+  // - Consequently, a broke player with a sufficient prior +add chips request will not be offered rebuy.
+  const afterAdds = applyPendingChipAdds(preAddFinished);
+
+  const finished = {
+    ...afterAdds,
+    pot: 0,
+    status: "finished" as GameStatus,
     showdown_summary,
     turn_deadline_at: null,
   };

@@ -11,15 +11,15 @@ import { BettingControls } from '@/components/game/BettingControls';
 import { JoinSeatModal } from '@/components/game/JoinSeatModal';
 import { SeatHostMenu } from '@/components/game/SeatHostMenu';
 import { HostJoinApprovals } from '@/components/game/HostJoinApprovals';
-import { HostChipAddApprovals } from '@/components/game/HostChipAddApprovals';
 import { HostRebuyApprovals } from '@/components/game/HostRebuyApprovals';
 import { TablePlayerControls } from '@/components/game/TablePlayerControls';
 import { TurnTimer } from '@/components/game/TurnTimer';
-import { ConfirmModal } from '@/components/game/ConfirmModal';
 import { AddChipsModal } from '@/components/game/AddChipsModal';
 import { TableBanner } from '@/components/game/TableBanner';
+import { RebuyStackModal } from '@/components/game/RebuyStackModal';
 import { messageFromGameApi } from '@/lib/game/safeErrors';
 import { formatStack } from '@/lib/formatStack';
+import { getBuyInRange } from '@/lib/game/seatManagement';
 import type { Card, Player } from '@/types/game';
 
 export default function GamePage() {
@@ -60,6 +60,7 @@ export default function GamePage() {
   // Rebuy modal (popup) + live countdown (instead of RebuyBanner in action area). open derived to avoid set-in-effect.
   const [rebuySecondsLeft, setRebuySecondsLeft] = useState(0);
   const [justRequestedRebuy, setJustRequestedRebuy] = useState(false);
+  const [rebuyInteracting, setRebuyInteracting] = useState(false); // pause countdown + keep modal open while user is typing/editing
 
   // Per-player "add chips" request (for the seated player's own seat)
   const [addChipsModal, setAddChipsModal] = useState<{ seat: number; displayName?: string } | null>(null);
@@ -67,6 +68,8 @@ export default function GamePage() {
   const [addChipsError, setAddChipsError] = useState<string | null>(null);
 
   const isHost = !!game?.host_id && userId === game.host_id;
+
+  const buyInRange = game ? getBuyInRange(game) : { minCents: 10000, maxCents: 10000 };
 
   const myHighHand = useMemo(() => {
     if (!myPlayer || !game) return null;
@@ -82,14 +85,16 @@ export default function GamePage() {
     !!game &&
     game.rebuy_offered_seats?.includes(myPlayer.seat) &&
     !!game.rebuy_deadline_at;
-  const rebuyModalOpen = rebuyOffered && rebuySecondsLeft > 0 && !justRequestedRebuy;
+  const rebuyModalOpen = rebuyOffered && (rebuySecondsLeft > 0 || rebuyInteracting) && !justRequestedRebuy;
   useEffect(() => {
     if (!rebuyOffered || !game?.rebuy_deadline_at) {
       setRebuySecondsLeft(0);
       setJustRequestedRebuy(false);
+      setRebuyInteracting(false);
       return;
     }
     const tick = () => {
+      if (rebuyInteracting) return; // pause the displayed countdown while user is interacting (typing etc.)
       const ms = new Date(game.rebuy_deadline_at!).getTime() - Date.now();
       const secs = Math.max(0, Math.ceil(ms / 1000));
       setRebuySecondsLeft(secs);
@@ -101,7 +106,7 @@ export default function GamePage() {
       window.clearTimeout(t0);
       window.clearInterval(id);
     };
-  }, [rebuyOffered, game?.rebuy_deadline_at, game]);
+  }, [rebuyOffered, game?.rebuy_deadline_at, game, rebuyInteracting]);
 
   const postGameAction = async (body: Record<string, unknown>) => {
     const res = await fetch(`/api/game/${gameId}`, {
@@ -144,12 +149,14 @@ export default function GamePage() {
     setJoinBusy(true);
     setJoinError(null);
     try {
+      // Use direct 'join' (auto buy-in with server enforcement of 100 pre-start or range post-start).
+      // No host approval step for standard buy-ins.
       const res = await fetch(`/api/game/${gameId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
         body: JSON.stringify({
-          action: 'requestJoin',
+          action: 'join',
           seat: joinModal.seat,
           displayName,
           startingStackCents: stackCents,
@@ -180,28 +187,23 @@ export default function GamePage() {
     setAddChipsBusy(true);
     setAddChipsError(null);
     try {
-      // Host adding via their own seat button skips the pending approval (direct hostAddStack).
-      const isDirectHostAdd = !!isHost;
-      const actionName = isDirectHostAdd ? 'hostAddStack' : 'requestAddChips';
-      const body: any = isDirectHostAdd
-        ? { action: actionName, seat: addChipsModal.seat, amountCents }
-        : { action: actionName, amountCents };
+      // Direct add chips (bounded by buy-in range minus current stack; no request or host approval).
       const res = await fetch(`/api/game/${gameId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: JSON.stringify(body),
+        body: JSON.stringify({ action: 'addChips', amountCents }),
       });
       let data: { error?: string; code?: string } = {};
       try { data = await res.json(); } catch {}
       if (!res.ok) {
-        setAddChipsError(messageFromGameApi(data, 'Could not request add chips'));
+        setAddChipsError(messageFromGameApi(data, 'Could not add chips'));
         return;
       }
       setAddChipsModal(null);
       await refresh();
     } catch {
-      setAddChipsError('Could not request chip add. Check your connection and try again.');
+      setAddChipsError('Could not add chips. Check your connection and try again.');
     } finally {
       setAddChipsBusy(false);
     }
@@ -422,7 +424,7 @@ export default function GamePage() {
                             setAddChipsModal({ seat: player.seat, displayName: player.display_name });
                           }}
                           className="mt-0.5 text-[9px] px-1.5 py-0.5 rounded bg-emerald-800/70 hover:bg-emerald-700 text-emerald-200 border border-emerald-700/50"
-                          title="Request to add chips (host approval required)"
+                          title="Add chips (direct, up to current table maximum total stack)"
                         >
                           + add chips
                         </button>
@@ -594,15 +596,6 @@ export default function GamePage() {
         />
       )}
 
-      {isHost && (game.pending_chip_adds?.length ?? 0) > 0 && (
-        <HostChipAddApprovals
-          game={game}
-          busy={actionBusy}
-          onApprove={(requestId) => void runAction({ action: 'approveAddChips', requestId })}
-          onDeny={(requestId) => void runAction({ action: 'denyAddChips', requestId })}
-        />
-      )}
-
       {isHost && (game.pending_rebuys?.length ?? 0) > 0 && (
         <HostRebuyApprovals
           game={game}
@@ -614,12 +607,19 @@ export default function GamePage() {
 
       <JoinSeatModal
         open={!!joinModal}
-        title="Request a seat"
-        subtitle="The host will approve. You will not be dealt into the current hand if one is in progress."
+        title="Take a seat"
+        subtitle={
+          game?.status === 'waiting'
+            ? 'Initial buy-in is fixed at 100. You will be seated immediately (no host approval).'
+            : `Choose stack within current table limits (${(buyInRange.minCents/100).toFixed(2)}–${(buyInRange.maxCents/100).toFixed(2)}). Seated immediately (no host approval).`
+        }
         seat={joinModal?.seat}
-        submitLabel="Request seat"
+        submitLabel="Take seat"
         busy={joinBusy}
         error={joinError}
+        fixedStackCents={game?.status === 'waiting' ? 10000 : undefined}
+        minStackCents={game?.status === 'waiting' ? undefined : buyInRange.minCents}
+        maxStackCents={game?.status === 'waiting' ? undefined : buyInRange.maxCents}
         onClose={() => !joinBusy && setJoinModal(null)}
         onSubmit={submitJoin}
       />
@@ -630,6 +630,12 @@ export default function GamePage() {
         displayName={addChipsModal?.displayName}
         busy={addChipsBusy}
         error={addChipsError}
+        maxAddCents={(() => {
+          if (!game || !myPlayer) return undefined;
+          const range = buyInRange;
+          return Math.max(0, range.maxCents - myPlayer.stack);
+        })()}
+        currentStack={myPlayer?.stack}
         onClose={() => !addChipsBusy && setAddChipsModal(null)}
         onSubmit={submitAddChips}
       />
@@ -648,22 +654,31 @@ export default function GamePage() {
         />
       )}
 
-      {/* Rebuy modal popup (not in action section / banner). Auto-opens when offered to you. */}
+      {/* Rebuy modal (direct, no host approval). Slider + text with blank box on open (no prepopulate).
+          OK uses the value in the text box. Leave Table stands the player up. */}
       {myPlayer && game && (
-        <ConfirmModal
+        <RebuyStackModal
           open={rebuyModalOpen}
-          title="Rebuy?"
-          message={`You are out of chips. Request rebuy for ${formatStack((game.blinds?.big ?? 50) * 200)} within ${rebuySecondsLeft}s (host approval required)?`}
-          confirmLabel={`Request rebuy ${formatStack((game.blinds?.big ?? 50) * 200)}`}
-          cancelLabel="Not now"
+          minCents={buyInRange.minCents}
+          maxCents={buyInRange.maxCents}
           busy={actionBusy}
-          onConfirm={() => {
-            setJustRequestedRebuy(true); // close modal immediately for this player
-            const amt = (game.blinds?.big ?? 50) * 200;
-            // Request goes to host for approval (no immediate stack award).
-            void runAction({ action: 'requestRebuy', startingStackCents: amt });
+          secondsLeft={rebuySecondsLeft}
+          error={null}
+          onInteraction={() => setRebuyInteracting(true)}
+          onConfirm={(amt) => {
+            setJustRequestedRebuy(true);
+            setRebuyInteracting(false);
+            // Direct rebuy (validated server-side against current post-payout range).
+            void runAction({ action: 'rebuy', startingStackCents: amt });
           }}
-          onCancel={() => { /* just hide; server timeout will set away if no rebuy */ }}
+          onLeaveTable={() => {
+            setRebuyInteracting(false);
+            void runAction({ action: 'standUp' });
+          }}
+          onCancel={() => {
+            setRebuyInteracting(false);
+            /* just hide; server timeout will set away if no rebuy */
+          }}
         />
       )}
     </div>

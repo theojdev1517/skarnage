@@ -27,6 +27,8 @@ import {
   requestRebuy,
   approveRebuy,
   denyRebuy,
+  directJoin,
+  applyPendingChipAdds,
 } from '@/lib/game/seatManagement';
 import { saveGameState } from '@/lib/game/persistGame';
 import {
@@ -180,6 +182,46 @@ export async function POST(
           displayName,
           startingStackCents
         );
+        break;
+      }
+
+      case 'join': {
+        // Direct/auto join (no host approval). Stack validated inside directJoin per pre-start vs post-start rules.
+        const seat = parseSeat(body.seat);
+        const displayName = parseDisplayName(body.displayName);
+        const startingStackCents = parseCents(
+          body.startingStackCents,
+          'Starting stack'
+        );
+        assertPhaseAllows(game, 'requestJoin'); // reuse same phase allowance (joins always ok)
+        const joined = directJoin(
+          game,
+          user.id,
+          seat,
+          displayName,
+          startingStackCents
+        );
+        result = joined.game;
+        hostIdUpdate = joined.hostId;
+        break;
+      }
+
+      case 'addChips': {
+        // Queue via pending (for mid-hand deferral). If currently between hands (finished), apply immediately.
+        // Mid-hand: will be applied post-awardPot (before rebuy decisions).
+        // Bounded at apply time. No host approval.
+        const amountCents = parseCents(body.amountCents, 'Add chips amount');
+        result = requestAddChips(game, user.id, amountCents);
+        if (game.status === 'finished') {
+          result = applyPendingChipAdds(result);
+        }
+        // Set "back" immediately (for +add chips while away or at 0).
+        result = {
+          ...result,
+          players: result.players.map((p) =>
+            p.user_id === user.id ? { ...p, presence: 'active' as const, seat_intent: 'none' as const } : p
+          ),
+        };
         break;
       }
 

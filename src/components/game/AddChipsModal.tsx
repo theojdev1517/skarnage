@@ -9,6 +9,9 @@ type AddChipsModalProps = {
   displayName?: string;
   busy?: boolean;
   error?: string | null;
+  /** If provided, the add will be capped so current + add does not exceed the buy-in max. */
+  maxAddCents?: number;
+  currentStack?: number;
   onClose: () => void;
   onSubmit: (amountCents: number) => void;
 };
@@ -19,16 +22,21 @@ export function AddChipsModal({
   displayName,
   busy = false,
   error = null,
+  maxAddCents,
+  currentStack,
   onClose,
   onSubmit,
 }: AddChipsModalProps) {
-  const [amount, setAmount] = useState('50');
+  const [amount, setAmount] = useState('25');
   const [formError, setFormError] = useState<string | null>(null);
+
+  const maxDisplay = maxAddCents != null ? formatStack(maxAddCents) : null;
+  const currentDisplay = currentStack != null ? formatStack(currentStack) : null;
 
   useEffect(() => {
     if (open) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
-      setAmount('50');
+      setAmount('25');
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setFormError(null);
     }
@@ -47,10 +55,19 @@ export function AddChipsModal({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    const cents = dollarsToCents(amount);
+    let cents = dollarsToCents(amount);
     if (cents === null || cents <= 0) {
       setFormError('Enter a valid amount greater than zero.');
       return;
+    }
+    if (maxAddCents != null) {
+      if (cents > maxAddCents) {
+        cents = maxAddCents;
+      }
+      if (cents <= 0) {
+        setFormError('You are at the maximum allowed stack and cannot add more.');
+        return;
+      }
     }
     setFormError(null);
     onSubmit(cents);
@@ -75,7 +92,11 @@ export function AddChipsModal({
           {seat !== undefined && (
             <p className="text-amber-400/90 text-sm mt-1">Seat {seat}{displayName ? ` · ${displayName}` : ''}</p>
           )}
-          <p className="text-zinc-400 text-sm mt-2">Request an add to your stack. Host must approve.</p>
+          <p className="text-zinc-400 text-sm mt-2">
+            Add to your stack (direct, no host approval).
+            {currentDisplay && ` Current: ${currentDisplay}.`}
+            {maxDisplay && ` Max add: ${maxDisplay} (to reach table limit).`}
+          </p>
         </div>
 
         <form onSubmit={handleSubmit} className="px-6 py-5 space-y-4">
@@ -114,7 +135,7 @@ export function AddChipsModal({
               disabled={busy}
               className="flex-1 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-600 font-medium disabled:opacity-50"
             >
-              {busy ? 'Sending…' : 'Request add chips'}
+              {busy ? 'Adding…' : 'Add chips'}
             </button>
           </div>
         </form>

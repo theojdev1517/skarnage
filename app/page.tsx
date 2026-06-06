@@ -85,6 +85,7 @@ export default function Home() {
         submitLabel="Create table"
         busy={loading}
         error={createError}
+        fixedStackCents={10000}
         onClose={() => !loading && setShowCreateModal(false)}
         onSubmit={createNewGame}
       />

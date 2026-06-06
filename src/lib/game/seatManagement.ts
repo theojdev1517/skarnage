@@ -2,6 +2,7 @@ import type { GameState, PendingJoinRequest } from '@/types/game';
 import { GameApiError, GameErrorCode } from '@/lib/game/apiErrors';
 import { now } from '@/lib/game/time';
 import { GAME_CONFIG } from '@/lib/game/config';
+import { formatStack } from '@/lib/formatStack';
 import {
   addSeconds,
   canApplySeatIntentNow,
@@ -13,6 +14,43 @@ import {
 
 function findPlayer(game: GameState, userId: string) {
   return game.players.find((p) => p.user_id === userId);
+}
+
+function getLargestPositiveStackCents(game: GameState): number {
+  const g = normalizeGameState(game);
+  const positive = g.players.map((p) => p.stack).filter((s) => s > 0);
+  return positive.length ? Math.max(...positive) : 0;
+}
+
+/**
+ * Returns the allowed buy-in/rebuy range per the house rules.
+ * Min is always exactly 10000 cents.
+ * Max follows the clarified buckets:
+ *   - largest <= 100: 100
+ *   - 100 < largest <= 200: largest (100% match)
+ *   - 200 < largest <= 266.66: 200
+ *   - largest > 266.66: 75% of largest, rounded to nearest 5 dollars
+ * Max is guaranteed >= 100. Works from current player stacks (post-payout for rebuys).
+ */
+export function getBuyInRange(game: GameState): { minCents: number; maxCents: number } {
+  const MIN_CENTS = 10000;
+  const largestCents = getLargestPositiveStackCents(game);
+  const L = largestCents / 100; // dollars for bucket logic
+
+  let maxD: number;
+  if (L <= 100) {
+    maxD = 100;
+  } else if (L <= 200) {
+    maxD = L;
+  } else if (L <= 266.66) {
+    maxD = 200;
+  } else {
+    const p75 = 0.75 * L;
+    maxD = Math.round(p75 / 5) * 5;
+  }
+  maxD = Math.max(100, maxD);
+  const maxCents = Math.round(maxD * 100);
+  return { minCents: MIN_CENTS, maxCents };
 }
 
 export function requestJoin(
@@ -71,6 +109,150 @@ export function requestJoin(
     pending_joins: [...g.pending_joins, request],
     updated_at: now(),
     last_action: `${displayName} requested seat ${seat} (awaiting host)`,
+  };
+}
+
+/**
+ * Direct (auto) join / take seat. Validates the starting stack against current rules
+ * (exactly 100 if game not started / status==="waiting"; otherwise within getBuyInRange).
+ * Seats immediately without creating a pending request or requiring host approval.
+ * Reuses the same mid-hand / waits_for_button / first-host logic as approveJoin.
+ */
+export function directJoin(
+  game: GameState,
+  userId: string,
+  seat: number,
+  displayName: string,
+  startingStackCents: number
+): { game: GameState; hostId?: string } {
+  const g = normalizeGameState(game);
+
+  // Enforce buy-in rules (pre-start always 100; post-start in range)
+  const isPreStart = g.status === 'waiting';
+  let effectiveStack = startingStackCents;
+  if (isPreStart) {
+    effectiveStack = 10000;
+  } else {
+    const range = getBuyInRange(g);
+    if (effectiveStack < range.minCents || effectiveStack > range.maxCents) {
+      throw new GameApiError(
+        GameErrorCode.INVALID_REQUEST,
+        `Starting stack must be between ${range.minCents / 100} and ${range.maxCents / 100}.`,
+        400
+      );
+    }
+  }
+
+  if (effectiveStack <= 0) {
+    throw new GameApiError(
+      GameErrorCode.INVALID_REQUEST,
+      'Starting stack must be greater than zero.',
+      400
+    );
+  }
+
+  const existing = findPlayer(g, userId);
+  if (existing) {
+    throw new GameApiError(
+      GameErrorCode.INVALID_REQUEST,
+      `You are already in seat ${existing.seat}.`,
+      409
+    );
+  }
+
+  if (g.players.some((p) => p.seat === seat)) {
+    throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'That seat is already taken.', 409);
+  }
+
+  // Note: we intentionally do NOT check/create pending_joins here — this is the direct/auto path.
+  // (Old pending path via requestJoin is still available for any edge/manual use.)
+
+  const handLive = isHandInProgress(g.status);
+  const midHand = handLive;
+
+  const newPlayer = defaultPlayerFields({
+    user_id: userId,
+    seat,
+    display_name: displayName,
+    stack: effectiveStack,
+    contributed_this_hand: 0,
+    bet_this_street: 0,
+    hole_cards: [],
+    live_hole_cards: [],
+    shredded_cards: [],
+    status: 'active',
+    current_pip_total: 0,
+    final_pip_total: null,
+    hand_result: null,
+    in_current_hand: !midHand,
+    waits_for_button: midHand,
+    presence: 'active',
+    seat_intent: 'none',
+  });
+
+  let next: GameState = {
+    ...g,
+    players: [...g.players, newPlayer].sort((a, b) => a.seat - b.seat),
+    // Do not touch pending_joins in direct path
+    updated_at: now(),
+    last_action: midHand
+      ? `${displayName} seated in ${seat} (waits for next hand)`
+      : `${displayName} joined seat ${seat}`,
+  };
+
+  let hostId: string | undefined;
+  if (!g.host_id) {
+    next = { ...next, host_id: userId };
+    hostId = userId;
+  }
+
+  return { game: next, hostId };
+}
+
+/**
+ * Applies any pending chip adds (from +add chips requests).
+ * - Credits the stacks (capped so final <= current buy-in max at apply time).
+ * - Clears the pending list.
+ * - Appends to last_action.
+ * Called post-award (so adds take effect after pot awarded, and before rebuy offers/decisions)
+ * and also in prepare for between-hand requests or safety.
+ */
+export function applyPendingChipAdds(game: GameState): GameState {
+  const g = normalizeGameState(game);
+  const pendingAdds = g.pending_chip_adds || [];
+  if (pendingAdds.length === 0) return g;
+
+  const range = getBuyInRange(g);
+  const maxTotal = range.maxCents;
+
+  const updatedPlayers = g.players.map((p) => {
+    const req = pendingAdds.find((r) => r.user_id === p.user_id);
+    if (req) {
+      const addAmt = Math.min(req.amount_cents, Math.max(0, maxTotal - p.stack));
+      return { ...p, stack: p.stack + addAmt };
+    }
+    return p;
+  });
+
+  // Build a nice note for which adds were applied
+  const appliedNotes: string[] = [];
+  for (const req of pendingAdds) {
+    const p = g.players.find((pp) => pp.user_id === req.user_id);
+    if (p) {
+      const addAmt = Math.min(req.amount_cents, Math.max(0, maxTotal - p.stack));
+      if (addAmt > 0) {
+        appliedNotes.push(`${p.display_name} +${formatStack(addAmt)}`);
+      }
+    }
+  }
+  const addNote = appliedNotes.length > 0 ? ` (chip adds applied: ${appliedNotes.join('; ')})` : ' (pending chip adds applied)';
+
+  return {
+    ...g,
+    players: updatedPlayers,
+    pending_chip_adds: [],
+    last_action: `${g.last_action || ''}${addNote}`.trim(),
+    updated_at: now(),
   };
 }
 
@@ -319,6 +501,10 @@ export function applyPendingSeatIntents(game: GameState): GameState {
 export function preparePlayersForNewHand(game: GameState): GameState {
   let g = applyPendingSeatIntents(game);
 
+  // Apply pending chip adds (post previous award or for between-hand requests).
+  // Capping and clearing happens inside.
+  g = applyPendingChipAdds(g);
+
   g = {
     ...g,
     players: g.players.map((p) => {
@@ -407,6 +593,17 @@ export function playerRebuy(
   if (!isRebuyWindowOpen(g)) {
     throw new GameApiError(GameErrorCode.WRONG_PHASE, 'Rebuy window has closed.', 409);
   }
+
+  // Enforce auto-rebuy range (min 100, max per current post-payout largest)
+  const range = getBuyInRange(g);
+  if (stackCents < range.minCents || stackCents > range.maxCents) {
+    throw new GameApiError(
+      GameErrorCode.INVALID_REQUEST,
+      `Rebuy stack must be between ${range.minCents / 100} and ${range.maxCents / 100}.`,
+      400
+    );
+  }
+
   if (stackCents <= 0) {
     throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'Rebuy amount must be positive.', 400);
   }
@@ -415,7 +612,7 @@ export function playerRebuy(
   return {
     ...g,
     players: g.players.map((p) =>
-      p.user_id === userId ? { ...p, stack: stackCents, presence: 'active' as const } : p
+      p.user_id === userId ? { ...p, stack: stackCents, presence: 'active' as const, seat_intent: 'none' as const } : p
     ),
     rebuy_offered_seats: remaining,
     rebuy_deadline_at: remaining.length === 0 ? null : g.rebuy_deadline_at,
@@ -492,7 +689,7 @@ export function requestAddChips(game: GameState, userId: string, amountCents: nu
     ...g,
     pending_chip_adds: [...(g.pending_chip_adds || []), req],
     updated_at: now(),
-    last_action: `${player.display_name} requested +${(amountCents / 100).toFixed(2)} chips (pending host approval)`,
+    last_action: `${player.display_name} requested +${(amountCents / 100).toFixed(2)} chips (will apply after current hand)`,
   };
 }
 
@@ -568,6 +765,15 @@ export function requestRebuy(game: GameState, userId: string, stackCents: number
   if (stackCents <= 0) {
     throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'Rebuy amount must be positive.', 400);
   }
+  // Enforce range even for pending requests (defensive)
+  const range = getBuyInRange(g);
+  if (stackCents < range.minCents || stackCents > range.maxCents) {
+    throw new GameApiError(
+      GameErrorCode.INVALID_REQUEST,
+      `Rebuy stack must be between ${range.minCents / 100} and ${range.maxCents / 100}.`,
+      400
+    );
+  }
   const pendings = g.pending_rebuys || [];
   if (pendings.some((r) => r.user_id === userId)) {
     throw new GameApiError(GameErrorCode.INVALID_REQUEST, 'You already have a pending rebuy request.', 409);
@@ -621,7 +827,7 @@ export function approveRebuy(game: GameState, hostUserId: string, requestId: str
   }
 
   const updatedPlayers = g.players.map((p) =>
-    p.user_id === req.user_id ? { ...p, stack: req.starting_stack_cents, presence: 'active' as const } : p
+    p.user_id === req.user_id ? { ...p, stack: req.starting_stack_cents, presence: 'active' as const, seat_intent: 'none' as const } : p
   );
 
   const remainingPendings = pendings.filter((r) => r.id !== requestId);

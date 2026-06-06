@@ -32,6 +32,7 @@ export async function POST(request: NextRequest) {
     }
 
     const gameId = crypto.randomUUID();
+    // createNewGame forces exactly 100 for the host (initial buy-in rule); the passed value is ignored.
     const initialState = engine.createNewGame(
       gameId,
       user.id,

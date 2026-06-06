@@ -206,23 +206,33 @@ export function BettingControls({
             >
               Call {bounds && bounds.toCall > 0 ? formatStack(Math.min(bounds.toCall, player.stack)) : ''}
             </button>
-            {player.stack > (bounds?.toCall ?? 0) && (
-              <button
-                type="button"
-                disabled={busy || !bounds}
-                onClick={() => void submitWager()}
-                className="flex-1 py-2 rounded text-xs font-medium bg-amber-600 hover:bg-amber-500 disabled:opacity-50"
-              >
-                {(() => {
-                  if (!bounds) return 'Raise';
-                  const inputCents = dollarsToCents(wagerInput);
-                  let amt = bounds.minWagerTo;
-                  if (inputCents !== null && inputCents > 0) amt = inputCents;
-                  // Always show numeric amount (even for pot/max); e.g. "Raise 99.75"
-                  return `Raise ${formatStack(amt)}`;
-                })()}
-              </button>
-            )}
+            {(() => {
+              const toCall = bounds?.toCall ?? 0;
+              const hasStackForRaise = player.stack > toCall;
+              // Only show raise if there is at least one other player in the hand who is not all-in
+              // (i.e. someone who could potentially call/respond to a raise). If everyone else is all-in
+              // and this player covers them, a "raise" would just return the extra to him immediately.
+              const hasOtherActiveActor = game.players.some(
+                (p) => p.seat !== player.seat && p.in_current_hand && p.stack > 0 && p.status === 'active'
+              );
+              return hasStackForRaise && hasOtherActiveActor && (
+                <button
+                  type="button"
+                  disabled={busy || !bounds}
+                  onClick={() => void submitWager()}
+                  className="flex-1 py-2 rounded text-xs font-medium bg-amber-600 hover:bg-amber-500 disabled:opacity-50"
+                >
+                  {(() => {
+                    if (!bounds) return 'Raise';
+                    const inputCents = dollarsToCents(wagerInput);
+                    let amt = bounds.minWagerTo;
+                    if (inputCents !== null && inputCents > 0) amt = inputCents;
+                    // Always show numeric amount (even for pot/max); e.g. "Raise 99.75"
+                    return `Raise ${formatStack(amt)}`;
+                  })()}
+                </button>
+              );
+            })()}
           </>
         ) : (
           <>

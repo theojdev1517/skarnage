@@ -51,6 +51,39 @@ export function SeatHostMenu({
     }
   };
 
+  const handleEnter = () => {
+    const addC = addAmount.trim();
+    const remC = removeAmount.trim();
+    const setC = setAmount.trim();
+    const filledCount = [addC, remC, setC].filter((v) => v.length > 0).length;
+    if (filledCount !== 1) {
+      setMenuError('Choose add, remove, or set function (exactly one box)');
+      return;
+    }
+    if (addC) {
+      const cents = dollarsToCents(addC);
+      if (cents === null || cents <= 0) {
+        setMenuError('Enter a valid amount greater than zero.');
+        return;
+      }
+      run({ action: 'hostAddStack', seat: player.seat, amountCents: cents });
+    } else if (remC) {
+      const cents = dollarsToCents(remC);
+      if (cents === null || cents <= 0) {
+        setMenuError('Enter a valid amount greater than zero.');
+        return;
+      }
+      run({ action: 'hostRemoveStack', seat: player.seat, amountCents: cents });
+    } else if (setC) {
+      const cents = dollarsToCents(setC);
+      if (cents === null) {
+        setMenuError('Enter a valid stack amount.');
+        return;
+      }
+      run({ action: 'hostSetStack', seat: player.seat, stackCents: cents });
+    }
+  };
+
   const isCurrentHost = player.user_id === game.host_id;
 
   return (
@@ -80,6 +113,7 @@ export function SeatHostMenu({
               step="0.01"
               value={addAmount}
               onChange={(e) => setAddAmount(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleEnter(); } }}
               className="flex-1 bg-zinc-800 border border-zinc-600 rounded px-2 py-1 text-xs"
             />
             <button
@@ -107,6 +141,7 @@ export function SeatHostMenu({
               step="0.01"
               value={removeAmount}
               onChange={(e) => setRemoveAmount(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleEnter(); } }}
               className="flex-1 bg-zinc-800 border border-zinc-600 rounded px-2 py-1 text-xs"
             />
             <button
@@ -134,6 +169,7 @@ export function SeatHostMenu({
               step="0.01"
               value={setAmount}
               onChange={(e) => setSetAmount(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleEnter(); } }}
               className="flex-1 bg-zinc-800 border border-zinc-600 rounded px-2 py-1 text-xs"
             />
             <button
@@ -152,6 +188,15 @@ export function SeatHostMenu({
               Set
             </button>
           </div>
+
+          <button
+            type="button"
+            disabled={busy}
+            onClick={handleEnter}
+            className="w-full mt-1 py-1 rounded bg-zinc-700 hover:bg-zinc-600 text-xs font-medium disabled:opacity-50"
+          >
+            Enter (use filled box)
+          </button>
         </div>
 
         <button
