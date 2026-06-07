@@ -245,17 +245,20 @@ export async function POST(
         // appear after river).
         const preActing = game.players.find((p) => p.seat === seat);
         const preToCall = Math.max(0, (game.current_wager ?? 0) - (preActing?.bet_this_street ?? 0));
-        let preAllIn = false;
+        let addedCents = 0;
         if (betAction === 'call') {
-          preAllIn = preToCall >= (preActing?.stack ?? 0);
+          addedCents = Math.min(preToCall, preActing?.stack ?? 0);
         } else if (betAction === 'bet' || betAction === 'raise') {
-          preAllIn = amount >= (preActing?.stack ?? 0);
+          const preBet = preActing?.bet_this_street ?? 0;
+          addedCents = Math.min(amount - preBet, preActing?.stack ?? 0);
         }
+        let preAllIn = addedCents >= (preActing?.stack ?? 0) && addedCents > 0;
         await logLedgerEvent(supabase, gameId, game.hand_number, 'action', {
           seat,
           player: preActing?.display_name,
           action: betAction,
           amount_cents: amount,
+          added_cents: addedCents,
           to_cents: (betAction === 'raise' || betAction === 'bet') ? amount : undefined,
           all_in: preAllIn,
         }, user.id);
