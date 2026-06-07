@@ -3,6 +3,8 @@ import { GameApiError, GameErrorCode } from '@/lib/game/apiErrors';
 import { now } from '@/lib/game/time';
 import { GAME_CONFIG } from '@/lib/game/config';
 import { formatStack } from '@/lib/formatStack';
+import { logLedgerEvent } from './ledger';
+import type { SupabaseClient } from './persistGame';
 import {
   addSeconds,
   canApplySeatIntentNow,
@@ -135,7 +137,8 @@ export function directJoin(
   userId: string,
   seat: number,
   displayName: string,
-  startingStackCents: number
+  startingStackCents: number,
+  supabase?: import('@/lib/game/persistGame').SupabaseClient
 ): { game: GameState; hostId?: string } {
   const g = normalizeGameState(game);
 
@@ -228,6 +231,16 @@ export function directJoin(
   if (!g.host_id) {
     next = { ...next, host_id: userId };
     hostId = userId;
+  }
+
+  if (supabase) {
+    // Log under hand 0 for pre-start seatings (per spec); for joins after start, under the current hand_number.
+    logLedgerEvent(supabase, game.game_id, g.hand_number, 'meta', {
+      type: 'seat',
+      seat,
+      display_name: displayName,
+      stack_cents: effectiveStack,
+    }, userId);
   }
 
   return { game: next, hostId };

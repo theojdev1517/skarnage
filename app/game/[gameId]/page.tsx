@@ -21,6 +21,8 @@ import { messageFromGameApi } from '@/lib/game/safeErrors';
 import { formatStack } from '@/lib/formatStack';
 import { getBuyInRange } from '@/lib/game/seatManagement';
 import type { Card, Player } from '@/types/game';
+import { createClient } from '@/lib/supabase';
+import { reconstructHand } from '@/lib/game/reconstructLedger';
 
 export default function GamePage() {
   const { gameId } = useParams<{ gameId: string }>();
@@ -62,6 +64,12 @@ export default function GamePage() {
   const [justRequestedRebuy, setJustRequestedRebuy] = useState(false);
   const [rebuyInteracting, setRebuyInteracting] = useState(false); // pause countdown + keep modal open while user is typing/editing
 
+  // Ledger modal state
+  const [showLedgerModal, setShowLedgerModal] = useState(false);
+  const [ledgerEvents, setLedgerEvents] = useState<any[]>([]);
+  const [currentLedgerHand, setCurrentLedgerHand] = useState(0);
+  const [ledgerLoading, setLedgerLoading] = useState(false);
+
   // Per-player "add chips" request (for the seated player's own seat)
   const [addChipsModal, setAddChipsModal] = useState<{ seat: number; displayName?: string } | null>(null);
   const [addChipsBusy, setAddChipsBusy] = useState(false);
@@ -70,6 +78,11 @@ export default function GamePage() {
   const isHost = !!game?.host_id && userId === game.host_id;
 
   const buyInRange = game ? getBuyInRange(game) : { minCents: 10000, maxCents: 10000 };
+
+  const ledgerHands = useMemo(() => {
+    const hands = [...new Set(ledgerEvents.map((e: any) => e.hand_number))];
+    return hands.sort((a: number, b: number) => a - b);
+  }, [ledgerEvents]);
 
   const myHighHand = useMemo(() => {
     if (!myPlayer || !game) return null;
@@ -138,6 +151,44 @@ export default function GamePage() {
       timers.forEach(clearTimeout);
     };
   }, [game?.showdown_deadline_at, game?.rebuy_deadline_at, refresh]);
+
+  // Load ledger events when modal opens
+  useEffect(() => {
+    if (!showLedgerModal || !gameId) return;
+    setLedgerLoading(true);
+    const supabase = createClient();
+    supabase
+      .from('ledger_events')
+      .select('*')
+      .eq('game_id', gameId)
+      .order('hand_number', { ascending: true })
+      .order('seq', { ascending: true })
+      .then(({ data, error }: any) => {
+        if (error) {
+          console.error('Failed to load ledger:', error);
+          setLedgerEvents([]);
+        } else {
+          setLedgerEvents(data || []);
+          if (data && data.length > 0) {
+            const handNums: number[] = (data || [])
+              .map((e: any) => e.hand_number)
+              .filter((n: any): n is number => typeof n === 'number');
+            const uniqueHands = [...new Set(handNums)].sort((a, b) => a - b);
+            // Prefer last completed hand per live game state: current hand_number - 1 (clamped).
+            // This ensures opening ledger defaults to previous hand even if current hand has only a hand_start so far.
+            const currentHand = (game && typeof game.hand_number === 'number') ? game.hand_number : 0;
+            const desired = Math.max(0, currentHand - 1);
+            let chosen = 0;
+            if (uniqueHands.length > 0) {
+              const candidates = uniqueHands.filter((h) => h <= desired);
+              chosen = candidates.length > 0 ? candidates[candidates.length - 1] : uniqueHands[uniqueHands.length - 1];
+            }
+            setCurrentLedgerHand(chosen);
+          }
+        }
+        setLedgerLoading(false);
+      });
+  }, [showLedgerModal, gameId]);
 
   const postGameAction = async (body: Record<string, unknown>) => {
     const res = await fetch(`/api/game/${gameId}`, {
@@ -366,6 +417,13 @@ export default function GamePage() {
               Start Game
             </button>
           )}
+          <button
+            type="button"
+            onClick={() => setShowLedgerModal(true)}
+            className="bg-zinc-700 hover:bg-zinc-600 px-3 py-1 rounded"
+          >
+            Ledger
+          </button>
         </div>
       </header>
 
@@ -713,6 +771,75 @@ export default function GamePage() {
             /* just hide; server timeout will set away if no rebuy */
           }}
         />
+      )}
+
+      {showLedgerModal && (
+        <div
+          className="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm"
+          onClick={() => setShowLedgerModal(false)}
+        >
+          <div
+            className="w-full max-w-3xl rounded-2xl border border-emerald-800 bg-zinc-900 p-6 text-sm max-h-[80vh] flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-semibold text-emerald-300">Game Ledger</h2>
+              <button onClick={() => setShowLedgerModal(false)} className="text-zinc-400 hover:text-white">Close</button>
+            </div>
+
+            {ledgerLoading ? (
+              <div className="text-center py-8 text-zinc-400">Loading ledger events…</div>
+            ) : ledgerEvents.length === 0 ? (
+              <div className="text-center py-8 text-zinc-400">No ledger events recorded yet for this game.</div>
+            ) : (
+              <>
+                <div className="flex items-center gap-2 mb-3 flex-wrap">
+                  <button
+                    onClick={() => {
+                      const idx = ledgerHands.indexOf(currentLedgerHand);
+                      if (idx > 0) setCurrentLedgerHand(ledgerHands[idx - 1]);
+                    }}
+                    disabled={ledgerHands.indexOf(currentLedgerHand) === 0}
+                    className="px-2 py-1 rounded bg-zinc-800 border border-zinc-700 disabled:opacity-50"
+                  >
+                    ← Prev
+                  </button>
+                  <select
+                    value={currentLedgerHand}
+                    onChange={(e) => setCurrentLedgerHand(parseInt(e.target.value))}
+                    className="bg-zinc-950 border border-zinc-700 px-2 py-1 rounded"
+                  >
+                    {ledgerHands.map((h) => (
+                      <option key={h} value={h}>Hand {h}{h === 0 ? ' (pre-start metas)' : ''}</option>
+                    ))}
+                  </select>
+                  <button
+                    onClick={() => {
+                      const idx = ledgerHands.indexOf(currentLedgerHand);
+                      if (idx < ledgerHands.length - 1) setCurrentLedgerHand(ledgerHands[idx + 1]);
+                    }}
+                    disabled={ledgerHands.indexOf(currentLedgerHand) === ledgerHands.length - 1}
+                    className="px-2 py-1 rounded bg-zinc-800 border border-zinc-700 disabled:opacity-50"
+                  >
+                    Next →
+                  </button>
+                  <span className="text-xs text-zinc-500 ml-auto">
+                    {ledgerEvents.length} total events
+                  </span>
+                </div>
+
+                {/* Use div (not pre) so inline colored <span>s for cards render with the 4-color scheme.
+                    Bumped font from tiny (~11px effective) to ~13px as requested. */}
+                <div className="flex-1 overflow-auto bg-zinc-950 p-4 rounded text-[13px] leading-snug whitespace-pre-wrap font-mono border border-zinc-800">
+                  {reconstructHand(
+                    ledgerEvents.filter((e: any) => e.hand_number === currentLedgerHand),
+                    userId
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
       )}
     </div>
   );

@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import type { GameState } from '@/types/game';
 import * as engine from '@/lib/game/engine';
+import { logLedgerEvent } from '@/lib/game/ledger';
+import { GAME_CONFIG } from '@/lib/game/config';
 import { createServerClient } from '@/lib/supabase';
 import { sanitizeGameStateForUser } from '@/lib/game/clientView';
 import { GameApiError, GameErrorCode, gameErrorResponse } from '@/lib/game/apiErrors';
@@ -31,6 +33,7 @@ import {
   directJoin,
   applyPendingChipAdds,
 } from '@/lib/game/seatManagement';
+import { liveShowdownPlayers, resolveShowdown } from '@/lib/game/showdown';
 import { saveGameState } from '@/lib/game/persistGame';
 import {
   parseCents,
@@ -87,14 +90,26 @@ export async function GET(
     // catch up expired showdown timers, rebuy windows, and auto-start next hand without
     // requiring an explicit client mutation/POST).
     let game = applyRebuyTimeouts(loaded.game);
-    game = engine.applyShowdownTimeout(game);
 
+    let awardedHandNumber: number | null = null;
+    const preAwardStatus = game.status;
+    game = engine.applyShowdownTimeout(game, supabase);
+    if (preAwardStatus !== 'finished' && game.status === 'finished') {
+      awardedHandNumber = game.hand_number;
+    }
+
+    let advancedHandNumber: number | null = null;
     if (
       game.status === 'finished' &&
       !isRebuyWindowOpen(game) &&
       (game.pending_rebuys || []).length === 0
     ) {
-      game = engine.startNewHand(game);
+      const oldHand = game.hand_number || 0;
+      game = await engine.startNewHand(game, supabase);
+      const newHand = game.hand_number || 0;
+      if (newHand > oldHand) {
+        advancedHandNumber = newHand;
+      }
     }
 
     // If we advanced the state (timers fired or hand auto-started), attempt to persist.
@@ -103,8 +118,40 @@ export async function GET(
     if (game.updated_at !== loaded.game.updated_at) {
       try {
         await saveGameState(supabase, gameId, loaded.version, game, {});
+        // Log hand_start + deal_hole *only* for the request that successfully persisted
+        // the hand advance. This stops duplicate hand_start blocks and phantom "Your hand"
+        // (spurious deal_hole from temp shuffles in raced startNewHand calls from GET+POST).
+        if (advancedHandNumber != null) {
+          const seated = game.players
+            .filter((p) => p.presence === 'active' && p.stack > 0)
+            .map((p) => ({ seat: p.seat, display_name: p.display_name, stack_cents: p.stack }));
+          await logLedgerEvent(supabase, gameId, advancedHandNumber, 'hand_start', {
+            game_type: GAME_CONFIG.GAME_TYPE,
+            small_blind_cents: game.blinds.small,
+            big_blind_cents: game.blinds.big,
+            button_seat: game.button_seat,
+            small_blind_seat: game.last_blinds?.small_seat ?? null,
+            big_blind_seat: game.last_blinds?.big_seat ?? null,
+            seats: seated,
+          });
+          for (const p of game.players) {
+            if (p.hole_cards && p.hole_cards.length > 0) {
+              await logLedgerEvent(supabase, gameId, advancedHandNumber, 'deal_hole', {
+                player: p.display_name,
+                hole_cards: p.hole_cards,
+                user_id: p.user_id,
+              }, p.user_id);
+            }
+          }
+        }
+        // Similarly, only the "winning" request for an award logs the (one) showdown + hand_end.
+        // Prevents the 3x "End Hand" + repeated SHOWDOWN blocks from concurrent timeout applies.
+        if (awardedHandNumber != null) {
+          // Only log hand_end here (showdown shows logged at enter time for timing consistency).
+          await logLedgerEvent(supabase, gameId, awardedHandNumber, 'hand_end', {});
+        }
       } catch (e) {
-        // Stale concurrent update or other; safe to ignore for this response.
+        // Stale concurrent update or other; safe to ignore for this response. No ledger log on lost race.
       }
     }
 
@@ -146,16 +193,33 @@ export async function POST(
     // Apply any expired rebuy timeouts (sets broke non-rebuyers to away after 10s window)
     let game = applyRebuyTimeouts(loadedGame);
     // Apply invisible showdown timer: if past, perform awardPot now (pots, finished state, rebuy window)
-    game = engine.applyShowdownTimeout(game);
     let result: GameState;
     let hostIdUpdate: string | undefined;
+    // Track when *this* request advanced the hand (via explicit startHand or post-finish auto).
+    // We only emit the hand_start + deal_hole ledger events after the save succeeds.
+    // Combined with the same guard in GET, this ensures exactly one set of hand_start/deal_hole
+    // per hand even under concurrent GET catch-up + POST races (prevents dup "Start Hand" blocks
+    // and phantom "Your hand" cards from temporary shuffles in extra startNewHand calls).
+    let advancedHandNumber: number | null = null;
+    // Track when *this* request performed the award (via early applyShowdownTimeout on expired timer).
+    // Log hand_end early (before switch for action metas) to have End before post-hand metas.
+    // 'showdown' (shows) is logged at enter time for correct timing in both all-in-pre and regular.
+    let awardedHandNumber: number | null = null;
+
+    const preAwardStatus = game.status;
+    game = engine.applyShowdownTimeout(game, supabase);
+    if (preAwardStatus !== 'finished' && game.status === 'finished') {
+      awardedHandNumber = game.hand_number;
+      await logLedgerEvent(supabase, gameId, awardedHandNumber, 'hand_end', {});
+    }
 
     switch (action) {
       case 'startHand': {
         requireHost(game, user.id);
         assertPhaseAllows(game, 'startHand');
         assertCanStartHand(game);
-        result = engine.startNewHand(game);
+        result = await engine.startNewHand(game, supabase);
+        advancedHandNumber = result.hand_number || 0;
         break;
       }
 
@@ -175,16 +239,37 @@ export async function POST(
             400
           );
         }
-        result = engine.processBet(game, seat, betAction, amount, {
+        // Log the action BEFORE processBet (which may auto-advance streets on all-ins).
+        // This ensures the action event gets an earlier seq than any consequent street/shred logs,
+        // so in reconstruction the triggering action appears before the streets (e.g. all-in calls don't
+        // appear after river).
+        const preActing = game.players.find((p) => p.seat === seat);
+        const preToCall = Math.max(0, (game.current_wager ?? 0) - (preActing?.bet_this_street ?? 0));
+        let preAllIn = false;
+        if (betAction === 'call') {
+          preAllIn = preToCall >= (preActing?.stack ?? 0);
+        } else if (betAction === 'bet' || betAction === 'raise') {
+          preAllIn = amount >= (preActing?.stack ?? 0);
+        }
+        await logLedgerEvent(supabase, gameId, game.hand_number, 'action', {
+          seat,
+          player: preActing?.display_name,
+          action: betAction,
+          amount_cents: amount,
+          to_cents: (betAction === 'raise' || betAction === 'bet') ? amount : undefined,
+          all_in: preAllIn,
+        }, user.id);
+
+        result = await engine.processBet(game, seat, betAction, amount, {
           confirmFreeFold,
-        });
+        }, supabase);
         break;
       }
 
       case 'advance': {
         requireHost(game, user.id);
         assertPhaseAllows(game, 'advance');
-        result = engine.advanceToNextPhase(game);
+        result = await engine.advanceToNextPhase(game, supabase);
         break;
       }
 
@@ -227,10 +312,12 @@ export async function POST(
           user.id,
           seat,
           displayName,
-          startingStackCents
+          startingStackCents,
+          supabase
         );
         result = joined.game;
         hostIdUpdate = joined.hostId;
+        // Seat meta is logged inside directJoin (for hand 0 when pre-start, or current hand otherwise).
         break;
       }
 
@@ -278,12 +365,18 @@ export async function POST(
       case 'setAway': {
         assertPhaseAllows(game, 'setAway');
         result = requestSetAway(game, user.id);
+        logLedgerEvent(supabase, gameId, game.hand_number, 'meta', {
+          type: 'set_away',
+        }, user.id);
         break;
       }
 
       case 'standUp': {
         assertPhaseAllows(game, 'standUp');
         result = requestStandUp(game, user.id);
+        logLedgerEvent(supabase, gameId, game.hand_number, 'meta', {
+          type: 'stand_up',
+        }, user.id);
         break;
       }
 
@@ -291,6 +384,12 @@ export async function POST(
         assertPhaseAllows(game, 'rebuy');
         const stackCents = parseCents(body.startingStackCents, 'Rebuy stack');
         result = playerRebuy(game, user.id, stackCents);
+        const rebuyer = result.players.find((p: any) => p.user_id === user.id);
+        logLedgerEvent(supabase, gameId, game.hand_number, 'meta', {
+          type: 'rebuy',
+          display_name: rebuyer?.display_name,
+          stack_cents: stackCents,
+        }, user.id);
         break;
       }
 
@@ -298,6 +397,10 @@ export async function POST(
         assertPhaseAllows(game, 'requestAddChips');
         const amountCents = parseCents(body.amountCents, 'Add chips amount');
         result = requestAddChips(game, user.id, amountCents);
+        logLedgerEvent(supabase, gameId, game.hand_number, 'meta', {
+          type: 'add_chips',
+          amount_cents: amountCents,
+        }, user.id);
         break;
       }
 
@@ -325,6 +428,12 @@ export async function POST(
         assertPhaseAllows(game, 'requestRebuy');
         const stackCents = parseCents(body.startingStackCents, 'Rebuy stack');
         result = requestRebuy(game, user.id, stackCents);
+        const reqRebuyer = result.players.find((p: any) => p.user_id === user.id) || game.players.find((p: any) => p.user_id === user.id);
+        logLedgerEvent(supabase, gameId, game.hand_number, 'meta', {
+          type: 'request_rebuy',
+          display_name: reqRebuyer?.display_name,
+          stack_cents: stackCents,
+        }, user.id);
         break;
       }
 
@@ -352,7 +461,7 @@ export async function POST(
         assertPhaseAllows(game, 'turnTimeout');
         const seat = parseSeat(body.seat);
         assertActorOnTurn(game, seat, user.id);
-        result = engine.applyTurnTimeout(game, seat);
+        result = await engine.applyTurnTimeout(game, seat, supabase);
         break;
       }
 
@@ -362,6 +471,11 @@ export async function POST(
         const seat = parseSeat(body.seat);
         const amountCents = parseCents(body.amountCents, 'Amount');
         result = engine.hostAddToStack(game, seat, amountCents);
+        logLedgerEvent(supabase, gameId, game.hand_number, 'meta', {
+          type: 'host_add_stack',
+          seat,
+          amount_cents: amountCents,
+        }, user.id);
         break;
       }
 
@@ -427,12 +541,47 @@ export async function POST(
       !isRebuyWindowOpen(result) &&
       (result.pending_rebuys || []).length === 0
     ) {
-      result = engine.startNewHand(result);
+      const oldHand = result.hand_number || 0;
+      result = await engine.startNewHand(result, supabase);
+      const newHand = result.hand_number || 0;
+      if (newHand > oldHand) {
+        advancedHandNumber = newHand;
+      }
     }
 
     await saveGameState(supabase, gameId, version, result, {
       ...(hostIdUpdate ? { host_id: hostIdUpdate } : {}),
     });
+
+    // Emit hand_start + per-player deal_hole (for private "Your hand") *after* the save
+    // succeeded for this POST. (The GET path only logs inside its successful CAS save.)
+    if (advancedHandNumber != null) {
+      const seated = result.players
+        .filter((p) => p.presence === 'active' && p.stack > 0)
+        .map((p) => ({ seat: p.seat, display_name: p.display_name, stack_cents: p.stack }));
+      await logLedgerEvent(supabase, gameId, advancedHandNumber, 'hand_start', {
+        game_type: GAME_CONFIG.GAME_TYPE,
+        small_blind_cents: result.blinds.small,
+        big_blind_cents: result.blinds.big,
+        button_seat: result.button_seat,
+        small_blind_seat: result.last_blinds?.small_seat ?? null,
+        big_blind_seat: result.last_blinds?.big_seat ?? null,
+        seats: seated,
+      });
+      for (const p of result.players) {
+        if (p.hole_cards && p.hole_cards.length > 0) {
+          await logLedgerEvent(supabase, gameId, advancedHandNumber, 'deal_hole', {
+            player: p.display_name,
+            hole_cards: p.hole_cards,
+            user_id: p.user_id,
+          }, p.user_id);
+        }
+      }
+    }
+
+    // Note: hand_end was logged early (right after applyShowdownTimeout set the flag) so that
+    // it precedes any metas from the action switch (e.g. rebuys after award). Showdown shows
+    // are logged at enterShowdownWithTimer time.
 
     return NextResponse.json({
       success: true,

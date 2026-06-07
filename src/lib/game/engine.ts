@@ -38,6 +38,8 @@ import {
 } from "./showdown";
 import { now } from "./time";
 import { GAME_CONFIG } from "./config";
+import { logLedgerEvent } from "./ledger";
+import type { SupabaseClient } from "./persistGame";
 
 export { now };
 
@@ -116,7 +118,7 @@ export function calculatePipTotal(cards: Card[]): number {
     const rankStr = parseCardRank(card);
     if (rankStr === 'A') {
       total += 1;
-    } else if (['J', 'Q', 'K', '10'].includes(rankStr)) {
+    } else if (['J', 'Q', 'K', 'T'].includes(rankStr)) {
       total += 10;
     } else {
       const num = parseInt(rankStr, 10);
@@ -336,13 +338,14 @@ export type ProcessBetOptions = {
   confirmFreeFold?: boolean;
 };
 
-export function processBet(
+export async function processBet(
   game: GameState,
   seat: number,
   action: "fold" | "check" | "call" | "bet" | "raise",
   amount: number = 0,
-  options?: ProcessBetOptions
-): GameState {
+  options?: ProcessBetOptions,
+  supabase?: SupabaseClient
+): Promise<GameState> {
   const playerIndex = game.players.findIndex(p => p.seat === seat);
   if (playerIndex === -1) throw new Error("Player not found");
 
@@ -485,34 +488,34 @@ export function processBet(
         ? `${winner.display_name} wins the pot (everyone else folded)`
         : result.last_action,
     };
-    return enterShowdownWithTimer(base);
+    return enterShowdownWithTimer(base, undefined, supabase);
   }
 
   // Auto-proceed only if no more betting action possible (i.e. the last active player
   // has matched any all-in(s) or there is nothing left to call). This ensures the
   // covered player gets to call/fold/raise before auto-advancing on all-ins.
   if (countBettingPlayers(result) > 1 && noMoreBettingActionPossible(result)) {
-    result = advanceToNextPhase(result);
+    result = await advanceToNextPhase(result, supabase);
     // Do not auto-award here; if it reached showdown, enterShowdownWithTimer was used
     // and award will happen later via applyShowdownTimeout on the next mutation.
     return result;
   }
 
   if (isBettingRoundComplete(result)) {
-    result = advanceToNextPhase(result);
+    result = await advanceToNextPhase(result, supabase);
     // Do not auto-award here; showdown timer (if reached) will award on next apply.
   }
 
   return withTurnDeadline(result);
 }
 
-export function applyTurnTimeout(game: GameState, seat: number): GameState {
+export async function applyTurnTimeout(game: GameState, seat: number, supabase?: SupabaseClient): Promise<GameState> {
   assertTurnTimerExpired(game, seat);
   const player = game.players.find((p) => p.seat === seat);
   if (!player) throw new Error('Player not found');
   const toCall = Math.max(0, (game.current_wager ?? 0) - player.bet_this_street);
   const betAction = toCall > 0 ? 'fold' : 'check';
-  return processBet(game, seat, betAction, 0);
+  return await processBet(game, seat, betAction, 0, undefined, supabase);
 }
 
 
@@ -529,7 +532,7 @@ function formatChips(cents: number): string {
 
 const formatCents = formatChips;
 
-export function awardPot(game: GameState): GameState {
+export function awardPot(game: GameState, supabase?: SupabaseClient): GameState {
   assertShowdownReady(game);
 
   // Compute evals using full live players (for hand descriptions etc.)
@@ -660,6 +663,11 @@ export function awardPot(game: GameState): GameState {
     showdown_summary,
     turn_deadline_at: null,
   };
+
+  // showdown + hand_end ledger logs are now emitted by the API route *after* successful
+  // persist of the awarded/finished state (prevents triple "End Hand" + repeated SHOWDOWN
+  // from concurrent GET/POST applyShowdownTimeout races, same pattern as hand_start guard).
+
   return openRebuyWindow(finished);
 }
 
@@ -670,7 +678,7 @@ export function awardPot(game: GameState): GameState {
  * The actual awardPot (stack updates + finished + rebuy window) happens
  * when applyShowdownTimeout fires after the timer (on next API mutation).
  */
-function enterShowdownWithTimer(game: GameState, lastActionOverride?: string): GameState {
+function enterShowdownWithTimer(game: GameState, lastActionOverride?: string, supabase?: SupabaseClient): GameState {
   let g: GameState = {
     ...game,
     status: "showdown" as GameStatus,
@@ -688,6 +696,30 @@ function enterShowdownWithTimer(game: GameState, lastActionOverride?: string): G
   const fullResolution = resolveShowdown(g);
   g.showdown_summary = buildShowdownSummary(fullResolution);
 
+  // Log the 'showdown' event here (at reveal time), with shown hands for *all* players
+  // active at showdown (not just winners), plus the winner info. This ensures consistent
+  // behavior and correct timing for both regular hands and all-in preflop auto-runouts.
+  // The 'hand_end' is still logged later at actual award time (in route guards).
+  if (supabase) {
+    const livePlayers = liveShowdownPlayers(g);
+    const shown_hands = livePlayers.map((p: any) => ({
+      seat: p.seat,
+      display_name: p.display_name,
+      hole_cards: p.live_hole_cards || [],
+      hand_description: fullResolution.evaluations.get(p.user_id)?.description || 'hand',
+    }));
+    const enrich = (arr: any[] = []) => arr.map((w: any) => {
+      const pl = livePlayers.find((pp: any) => pp.seat === w.seat);
+      return { ...w, hole_cards: pl ? pl.live_hole_cards : [] };
+    });
+    logLedgerEvent(supabase, g.game_id, g.hand_number, "showdown", {
+      high_winners: enrich(g.showdown_summary.high_winners || []),
+      low_winners: enrich(g.showdown_summary.low_winners || []),
+      side_pots: g.side_pots || [],
+      shown_hands,
+    });
+  }
+
   return g;
 }
 
@@ -697,7 +729,7 @@ function enterShowdownWithTimer(game: GameState, lastActionOverride?: string): G
  * the next player action (or rebuy request) triggers the award, finished state,
  * and rebuy window.
  */
-export function applyShowdownTimeout(game: GameState): GameState {
+export function applyShowdownTimeout(game: GameState, supabase?: SupabaseClient): GameState {
   const g = normalizeGameState(game);
   if (g.status !== "showdown" || !g.showdown_deadline_at) return g;
 
@@ -710,7 +742,7 @@ export function applyShowdownTimeout(game: GameState): GameState {
     showdown_deadline_at: null,
   };
 
-  return awardPot(gameForAward);
+  return awardPot(gameForAward, supabase);
 }
 
 function firstActiveSeat(state: GameState, preferred: number | null): number | null {
@@ -869,7 +901,7 @@ function postBlind(state: GameState, seat: number, amount: number): GameState {
   return { ...state, players: newPlayers };
 }
 
-export function postBlinds(state: GameState): GameState {
+export function postBlinds(state: GameState, supabase?: SupabaseClient): GameState {
   const active = getActivePlayers(state);
   if (active.length < 2) return state;
 
@@ -979,15 +1011,22 @@ export function postBlinds(state: GameState): GameState {
   return withTurnDeadline(posted);
 }
 
-export function startNewHand(game: GameState): GameState {
+export async function startNewHand(game: GameState, supabase?: SupabaseClient): Promise<GameState> {
   let newGame = applyRebuyTimeouts(game);
   newGame = preparePlayersForNewHand(newGame);
   newGame = rotateButton(newGame);
   newGame = activateEligiblePlayersForHand(newGame);
 
+  const newHandNumber = (game.hand_number || 0) + 1;
+
+  // Hand start + hole card logging moved to API route after successful DB persist of the
+  // advanced state (see app/api/game/[gameId]/route.ts). This avoids duplicate hand_start
+  // rows and spurious 'deal_hole' rows (from temporary deck shuffles in raced startNewHand
+  // invocations by concurrent GETs during auto-advance).
+
   newGame = {
     ...newGame,
-    hand_number: (game.hand_number || 0) + 1,
+    hand_number: newHandNumber,
     pot: 0,
     side_pots: [],
     current_wager: 0,
@@ -1004,8 +1043,12 @@ export function startNewHand(game: GameState): GameState {
     showdown_deadline_at: null,
   };
 
-  newGame = postBlinds(newGame);
+  newGame = postBlinds(newGame, supabase);
   newGame = dealHoleCards(newGame);
+
+  // deal_hole (and hand_start) logging is handled by callers after persist to prevent dups
+  // from concurrent auto-advance attempts. We still accept+forward supabase for the rare
+  // case below where we auto-advance phases inside startNewHand (preflop all-ins after deal).
   // Do not overwrite current_player_seat here. postBlinds already set it based on the final
   // (possibly skipped-logic-overridden) bbSeat from assignment. Recomputing via getFirstToAct
   // would revert special cases and cause wrong first actor (e.g. BB getting first action).
@@ -1014,7 +1057,7 @@ export function startNewHand(game: GameState): GameState {
   // We let it reach the showdown+timer state (instead of immediate award) so players get the
   // 10s pause to see hole cards + results before pots are awarded.
   if (getActingPlayers(newGame).length === 0 && countBettingPlayers(newGame) > 1) {
-    newGame = advanceToNextPhase(newGame);
+    newGame = await advanceToNextPhase(newGame, supabase);
     return newGame;
   }
 
@@ -1112,7 +1155,7 @@ export function transferHost(game: GameState, seat: number): GameState {
  * Centralizes all dealing + position + status transitions.
  * This is the single place that knows "what comes after what".
  */
-export function advanceToNextPhase(game: GameState): GameState {
+export async function advanceToNextPhase(game: GameState, supabase?: SupabaseClient): Promise<GameState> {
   if (countBettingPlayers(game) <= 1) {
     const winner = game.players.find(
       (p) =>
@@ -1124,7 +1167,7 @@ export function advanceToNextPhase(game: GameState): GameState {
         ? `${winner.display_name} wins the pot`
         : game.last_action,
     };
-    return enterShowdownWithTimer(base);
+    return enterShowdownWithTimer(base, undefined, supabase);
   }
 
   let newGame = { ...game };
@@ -1145,21 +1188,97 @@ export function advanceToNextPhase(game: GameState): GameState {
   newGame.min_raise = 0;
   newGame.last_aggressor_seat = null;
 
+  // Snapshot previous shredded (by id) so we can log *only the new shreds for this street*
+  // (prevents cumulative "post-river summary" re-logs of all prior shreds, and allows
+  // recon to place "player gets X shredded" after the board+shredder lines for the street).
+  let prevShreddedById: Map<string | number, Set<string>> | null = null;
+  if (supabase) {
+    prevShreddedById = new Map();
+    game.players.forEach((p) => {
+      const id = p.user_id || p.seat;
+      prevShreddedById!.set(id, new Set(p.shredded_cards || []));
+    });
+  }
+
   // Advance phase + deal cards + set correct next player
   if (game.status === "preflop_betting" || game.status === "waiting") {
     newGame = dealFlop(newGame);
     newGame.status = "flop_betting" as GameStatus;
     newGame.current_player_seat = getFirstToAct(newGame, "postflop");
+    if (supabase) {
+      await logLedgerEvent(supabase, game.game_id, game.hand_number, "street", {
+        street: "flop",
+        board: newGame.board.top.filter(Boolean).slice(0, 3),
+        shredder: newGame.board.shredder.filter(Boolean).slice(0, 3),
+      });
+      // Log only deltas for this street's shreds (after street for recon order: board, shredder, then gets)
+      if (prevShreddedById) {
+        for (const p of newGame.players) {
+          const id = p.user_id || p.seat;
+          const prev = prevShreddedById.get(id) || new Set();
+          const newOnes = (p.shredded_cards || []).filter((c) => !prev.has(c));
+          if (newOnes.length > 0) {
+            await logLedgerEvent(supabase, game.game_id, game.hand_number, "shred", {
+              player: p.display_name,
+              shredded: newOnes,
+              live: p.live_hole_cards,
+            });
+          }
+        }
+      }
+    }
   } 
   else if (game.status === "flop_betting") {
     newGame = dealTurn(newGame);
     newGame.status = "turn_betting" as GameStatus;
     newGame.current_player_seat = getFirstToAct(newGame, "postflop");
+    if (supabase) {
+      await logLedgerEvent(supabase, game.game_id, game.hand_number, "street", {
+        street: "turn",
+        board: newGame.board.top.filter(Boolean),
+        shredder: newGame.board.shredder.filter(Boolean),
+      });
+      if (prevShreddedById) {
+        for (const p of newGame.players) {
+          const id = p.user_id || p.seat;
+          const prev = prevShreddedById.get(id) || new Set();
+          const newOnes = (p.shredded_cards || []).filter((c) => !prev.has(c));
+          if (newOnes.length > 0) {
+            await logLedgerEvent(supabase, game.game_id, game.hand_number, "shred", {
+              player: p.display_name,
+              shredded: newOnes,
+              live: p.live_hole_cards,
+            });
+          }
+        }
+      }
+    }
   } 
   else if (game.status === "turn_betting") {
     newGame = dealRiver(newGame);
     newGame.status = "river_betting" as GameStatus;
     newGame.current_player_seat = getFirstToAct(newGame, "postflop");
+    if (supabase) {
+      await logLedgerEvent(supabase, game.game_id, game.hand_number, "street", {
+        street: "river",
+        board: newGame.board.top.filter(Boolean),
+        shredder: newGame.board.shredder.filter(Boolean),
+      });
+      if (prevShreddedById) {
+        for (const p of newGame.players) {
+          const id = p.user_id || p.seat;
+          const prev = prevShreddedById.get(id) || new Set();
+          const newOnes = (p.shredded_cards || []).filter((c) => !prev.has(c));
+          if (newOnes.length > 0) {
+            await logLedgerEvent(supabase, game.game_id, game.hand_number, "shred", {
+              player: p.display_name,
+              shredded: newOnes,
+              live: p.live_hole_cards,
+            });
+          }
+        }
+      }
+    }
   }
   else if (game.status === "river_betting") {
     newGame.status = "showdown" as GameStatus;
@@ -1174,14 +1293,14 @@ export function advanceToNextPhase(game: GameState): GameState {
   if (countBettingPlayers(newGame) > 1 && noMoreBettingActionPossible(newGame)) {
     if (newGame.status === 'showdown') {
       // Reached showdown via auto — use timer instead of immediate award
-      return enterShowdownWithTimer(newGame);
+      return enterShowdownWithTimer(newGame, undefined, supabase);
     }
     newGame.current_player_seat = null; // don't expose turn to the lone actor
-    return advanceToNextPhase(newGame);
+    return await advanceToNextPhase(newGame, supabase);
   }
 
   if (newGame.status === 'showdown') {
-    return enterShowdownWithTimer(newGame);
+    return enterShowdownWithTimer(newGame, undefined, supabase);
   }
 
   return withTurnDeadline(newGame);

@@ -8,4 +8,5 @@ export const GAME_CONFIG = {
    *  Currently 5s for "in between hands" pause.
    */
   SHOWDOWN_TIMER_SECONDS: 5,
+  GAME_TYPE: 'skarney',
 } as const;

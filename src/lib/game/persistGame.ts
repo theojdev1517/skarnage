@@ -1,7 +1,7 @@
 import type { GameState } from '@/types/game';
 import { GameApiError, GameErrorCode } from '@/lib/game/apiErrors';
 
-type SupabaseClient = Awaited<
+export type SupabaseClient = Awaited<
   ReturnType<typeof import('@/lib/supabase').createServerClient>
 >;
 

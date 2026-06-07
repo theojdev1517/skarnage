@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import * as engine from '@/lib/game/engine';
+import { logLedgerEvent } from '@/lib/game/ledger';
 import { createServerClient } from '@/lib/supabase';
 import { GameApiError, GameErrorCode } from '@/lib/game/apiErrors';
 import { mapThrownError } from '@/lib/game/safeErrors';
@@ -55,6 +56,14 @@ export async function POST(request: NextRequest) {
         500
       );
     }
+
+    // Log the host's initial seating as a pre-start (hand 0) meta event so Hand 0 ledger shows all initial buy-ins.
+    logLedgerEvent(supabase, gameId, 0, 'meta', {
+      type: 'seat',
+      seat: 1,
+      display_name: displayName,
+      stack_cents: 10000,
+    }, user.id);
 
     return NextResponse.json({ gameId });
   } catch (error) {
